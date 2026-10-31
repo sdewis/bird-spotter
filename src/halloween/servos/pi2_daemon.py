@@ -137,10 +137,11 @@ class PiconZeroBoard:
     MODE_SERVO = 2
     RETRIES = 5
 
-    # Max degrees per 40ms tick on RPi 4
-    MAX_STEP_DEG = 10
-    TICK_SEC = 0.04
-    IDLE_DETACH_SEC = 0.35
+    # 100 Hz kinematic acceleration/deceleration loop for Pan (Ch 0) & Tilt (Ch 1)
+    TICK_SEC = 0.01
+    MAX_SPEED_DEG_S = 92.0
+    DECEL_CURVE_DEG_S2 = 145.0
+    JAW_MAX_STEP_DEG = 22
 
     def __init__(self, bus_id: int = 1) -> None:
         self.bus = open_i2c_bus(bus_id)
@@ -149,12 +150,13 @@ class PiconZeroBoard:
         self.last_revision: list[int] = [0, 0]
         self.last_activity_ts: float = time.monotonic()
 
-        # Per-channel state: current angle, target angle, whether PWM is currently attached, and last move time
+        # Per-channel state: integer angle written to hardware, floating-point kinematic state, and target angle
         self._curr_angle: dict[int, int] = {0: 90, 1: 90, 2: 85}
+        self._pos_deg: dict[int, float] = {0: 90.0, 1: 90.0, 2: 85.0}
+        self._vel_deg_s: dict[int, float] = {0: 0.0, 1: 0.0, 2: 0.0}
         self._target_angle: dict[int, int] = {0: 90, 1: 90, 2: 85}
         self._attached: dict[int, bool] = {0: False, 1: False, 2: False}
         self._last_move_ts: dict[int, float] = {0: 0.0, 1: 0.0, 2: 0.0}
-        self._rr_index: int = 0
 
         self.standby()
         threading.Thread(target=self._slew_worker, daemon=True).start()
@@ -209,6 +211,8 @@ class PiconZeroBoard:
         for ch, center_deg in ((0, pan_center), (1, tilt_center), (2, jaw_closed)):
             clamped = max(0, min(180, int(center_deg)))
             self._curr_angle[ch] = clamped
+            self._pos_deg[ch] = float(clamped)
+            self._vel_deg_s[ch] = 0.0
             self._target_angle[ch] = clamped
             self._attach_and_write(ch, clamped)
             time.sleep(0.20)
@@ -233,30 +237,94 @@ class PiconZeroBoard:
             self._target_angle[channel] = clamped
         return True
 
+    def _step_kinematic_axis(self, ch: int, dt: float) -> None:
+        """Advance Pan/Tilt axis along a smooth acceleration/deceleration velocity profile."""
+        pos = self._pos_deg[ch]
+        vel = self._vel_deg_s[ch]
+        targ = float(self._target_angle[ch])
+        err = targ - pos
+        dist = abs(err)
+
+        if dist < 0.15 and abs(vel) < 5.0:
+            self._pos_deg[ch] = targ
+            self._vel_deg_s[ch] = 0.0
+            targ_int = int(round(targ))
+            if targ_int != self._curr_angle[ch]:
+                self._attach_and_write(ch, targ_int)
+            return
+
+        direction = 1.0 if err >= 0.0 else -1.0
+        # Small delta (<= 6°): slow gentle speed; Large delta (> 6°): kinematic ramp up/down curve
+        if dist <= 6.0:
+            target_speed = 4.5 + 3.0 * dist
+        else:
+            target_speed = min(
+                self.MAX_SPEED_DEG_S,
+                math.sqrt((22.5 ** 2) + 2.0 * self.DECEL_CURVE_DEG_S2 * (dist - 6.0)),
+            )
+
+        desired_vel = direction * target_speed
+        dv = desired_vel - vel
+        same_dir = (vel * direction) >= -1e-6
+        speeding_up = same_dir and (abs(desired_vel) > abs(vel))
+
+        if speeding_up:
+            # Smooth acceleration ramp scaled by distance (soft for small deltas, strong ramp-up for large deltas)
+            accel = 55.0 + min(195.0, dist * 5.0)
+        else:
+            # Smooth deceleration to follow the braking curve into target without overshoot
+            accel = 260.0
+
+        max_dv = accel * dt
+        if abs(dv) > max_dv:
+            vel += math.copysign(max_dv, dv)
+        else:
+            vel = desired_vel
+
+        step = vel * dt
+        if abs(step) >= dist:
+            pos = targ
+            vel = 0.0
+        else:
+            pos += step
+
+        self._pos_deg[ch] = pos
+        self._vel_deg_s[ch] = vel
+
+        new_int = max(0, min(180, int(round(pos))))
+        if new_int != self._curr_angle[ch]:
+            self._attach_and_write(ch, new_int)
+
     def _slew_worker(self) -> None:
-        """Background loop that steps servos smoothly while keeping all channels continuously energized."""
-        channels = (0, 1, 2)
+        """100 Hz background loop applying acceleration/deceleration curves to skull Pan/Tilt servos."""
+        prev_t = time.monotonic()
         while True:
             time.sleep(self.TICK_SEC)
+            now = time.monotonic()
+            dt = max(0.002, min(0.05, now - prev_t))
+            prev_t = now
+
             if not self.initialized:
                 continue
 
-            for ch in channels:
-                curr = self._curr_angle[ch]
-                targ = self._target_angle[ch]
-                diff = targ - curr
-                if diff == 0:
-                    continue
+            # Smooth kinematic acceleration/deceleration for Pan (Ch 0) and Tilt (Ch 1)
+            self._step_kinematic_axis(0, dt)
+            self._step_kinematic_axis(1, dt)
 
-                step_limit = 22 if ch == 2 else self.MAX_STEP_DEG
-                step = max(-step_limit, min(step_limit, diff))
-                self._attach_and_write(ch, curr + step)
+            # Snappy syllable tracking for Jaw (Ch 2)
+            curr_jaw = self._curr_angle[2]
+            targ_jaw = self._target_angle[2]
+            diff_jaw = targ_jaw - curr_jaw
+            if diff_jaw != 0:
+                step_jaw = max(-self.JAW_MAX_STEP_DEG, min(self.JAW_MAX_STEP_DEG, diff_jaw))
+                self._attach_and_write(2, curr_jaw + step_jaw)
 
     def standby(self) -> None:
         """De-energize all outputs into safe STANDBY mode."""
         self.initialized = False
         for ch in (0, 1, 2):
             self._attached[ch] = False
+            self._vel_deg_s[ch] = 0.0
         self._write_byte(self.REG_RESET, 0)
         time.sleep(0.01)
 

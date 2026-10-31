@@ -3,13 +3,13 @@
   "cam_pan_center": -10800,
   "cam_tilt_center": 50400,
   "cam_pan_left": 205200,
-  "cam_pan_right": -262800,
+  "cam_pan_right": -334800,
   "cam_tilt_up": 144000,
   "cam_tilt_down": -36000,
   "servo_pan_center": 79,
   "servo_tilt_center": 134,
   "servo_pan_left": 151,
-  "servo_pan_right": 7,
+  "servo_pan_right": 0,
   "servo_tilt_up": 170,
   "servo_tilt_down": 118
 }

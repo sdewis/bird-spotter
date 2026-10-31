@@ -17,7 +17,7 @@ class PiconZeroClient:
     port: int = 5555
     enabled: bool = True
     heartbeat_interval_sec: float = 1.5
-    min_send_interval_sec: float = 0.12
+    min_send_interval_sec: float = 0.03
 
     # Live telemetry fields exposed to the web dashboard
     pi2_online: bool = False
@@ -205,13 +205,21 @@ class PiconZeroClient:
         jaw_closed: int = 85,
         jaw_open: int = 135,
     ) -> bool:
-        """Stream synthesized WAV bytes to RPi2 for 3.5mm audio output + jaw servo sync."""
+        """Stream synthesized WAV bytes to RPi4 for 3.5mm audio output + jaw servo sync."""
+        if not self.enabled or not self.pi2_online or self.pi2_state != "READY":
+            return False
         b64 = base64.b64encode(wav_bytes).decode("ascii")
-        return self._send_stream_json(
-            {
-                "play_wav_b64": b64,
-                "alsa_device": alsa_device,
-                "jaw_closed": jaw_closed,
-                "jaw_open": jaw_open,
-            }
-        )
+        payload = {
+            "play_wav_b64": b64,
+            "alsa_device": alsa_device,
+            "jaw_closed": jaw_closed,
+            "jaw_open": jaw_open,
+        }
+        try:
+            with socket.create_connection((self.host, self.port), timeout=2.5) as s:
+                s.settimeout(2.5)
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                s.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+            return True
+        except OSError:
+            return False
