@@ -186,6 +186,8 @@ def deploy_to_pi(
         "sudo modprobe snd_bcm2835 2>/dev/null || true; "
         "(dpkg -s python3-smbus i2c-tools alsa-utils >/dev/null 2>&1 || "
         "(sudo apt-get update -qq && sudo apt-get install -y -qq python3-smbus i2c-tools alsa-utils) || true) && "
+        "amixer -c Headphones sset PCM 100% unmute 2>/dev/null || amixer -c 2 sset PCM 100% unmute 2>/dev/null || true; "
+        "sudo alsactl store 2>/dev/null || true; "
         f"fuser -k {daemon_port}/tcp 2>/dev/null || true; "
         "sudo mv ~/halloween-pi2.service /etc/systemd/system/halloween-pi2.service && "
         "sudo systemctl daemon-reload && "

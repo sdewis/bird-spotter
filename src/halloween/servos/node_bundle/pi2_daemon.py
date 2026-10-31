@@ -280,7 +280,8 @@ class AudioJawPlayer:
         if self._aplay_proc is not None and self._aplay_proc.poll() is None:
             try:
                 self._aplay_proc.terminate()
-            except OSError:
+                self._aplay_proc.wait(timeout=0.3)
+            except (OSError, subprocess.TimeoutExpired):
                 pass
         if self._worker is not None and self._worker.is_alive():
             self._worker.join(timeout=0.5)
@@ -371,6 +372,11 @@ class AudioJawPlayer:
                     time.sleep(sleep_dt)
 
             self.board.set_servo(self.jaw_channel, jaw_closed)
+            if self._aplay_proc is not None:
+                try:
+                    self._aplay_proc.wait(timeout=1.0)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
 
 
 JAW_PLAYER = AudioJawPlayer(BOARD, jaw_channel=2)
@@ -473,6 +479,12 @@ def main() -> None:
 
     rev = BOARD.get_revision()
     BOARD.standby()
+    subprocess.run(
+        ["amixer", "-c", "Headphones", "sset", "PCM", "100%", "unmute"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
     print(
         f"[pi2_daemon] Booted in STANDBY mode (Picon Zero Rev: {rev}). "
         f"Waiting for RPi 5 power-on/init command on {args.host}:{args.port}..."
