@@ -1,15 +1,15 @@
 {
   "calibrated": true,
-  "cam_pan_center": -10800,
-  "cam_tilt_center": 50400,
-  "cam_pan_left": 205200,
-  "cam_pan_right": -334800,
-  "cam_tilt_up": 144000,
-  "cam_tilt_down": -36000,
-  "servo_pan_center": 79,
-  "servo_tilt_center": 134,
-  "servo_pan_left": 151,
-  "servo_pan_right": 0,
-  "servo_tilt_up": 170,
-  "servo_tilt_down": 118
+  "cam_pan_center": 36000,
+  "cam_tilt_center": 86400,
+  "cam_pan_left": 216000,
+  "cam_pan_right": -72000,
+  "cam_tilt_up": 201600,
+  "cam_tilt_down": -57600,
+  "servo_pan_center": 74,
+  "servo_tilt_center": 146,
+  "servo_pan_left": 133,
+  "servo_pan_right": 46,
+  "servo_tilt_up": 180,
+  "servo_tilt_down": 92
 }

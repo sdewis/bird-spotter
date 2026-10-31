@@ -28,6 +28,7 @@ class BipolarEngine:
     current_mood: Mood = Mood.IDLE
     last_swing_ts: float = field(default_factory=time.monotonic)
     inverted_phase: bool = False
+    _locked_track_id: int | None = field(default=None, init=False, repr=False)
 
     def _effective_priority(self, det: Detection) -> float:
         """Score detections so human faces/bodies and pets take gaze priority over background furniture."""
@@ -41,7 +42,7 @@ class BipolarEngine:
         return det.area_ratio
 
     def evaluate(self, detections: list[Detection]) -> tuple[Mood, Detection | None]:
-        """Select primary target and compute current bipolar mood."""
+        """Select primary target with sticky hysteresis and compute current bipolar mood."""
         now = time.monotonic()
         if now - self.last_swing_ts >= self.mood_swing_interval_sec:
             self.inverted_phase = not self.inverted_phase
@@ -49,9 +50,20 @@ class BipolarEngine:
 
         if not detections:
             self.current_mood = Mood.IDLE
+            self._locked_track_id = None
             return self.current_mood, None
 
-        primary = max(detections, key=self._effective_priority)
+        best_candidate = max(detections, key=self._effective_priority)
+        primary = best_candidate
+        if self._locked_track_id is not None:
+            locked_matches = [d for d in detections if d.track_id == self._locked_track_id]
+            if locked_matches:
+                locked_det = locked_matches[0]
+                # Keep tracking the currently locked target unless challenger is >50% stronger
+                if self._effective_priority(best_candidate) <= self._effective_priority(locked_det) * 1.50:
+                    primary = locked_det
+
+        self._locked_track_id = primary.track_id
 
         # Count distinct people without double-counting person + upper body + face of the same person
         if any(d.label == "person" for d in detections):

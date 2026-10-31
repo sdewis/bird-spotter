@@ -20,6 +20,9 @@ config/local.toml
 # Runtime artifacts & recordings
 logs/
 recordings/
+hailort.log
+models/piper/
+backups/*.tar.gz
 *.wav
 *.mp3
 !assets/audio/*.wav

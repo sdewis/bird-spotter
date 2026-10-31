@@ -184,6 +184,20 @@ def run_tracker(cfg: dict, duration_sec: float | None = None) -> int:
                 )
             elif preset == "faces_only":
                 detector.set_classes(("frontal face", "side face"))
+        elif action == "set_sensitivity":
+            mode = str(cmd.get("mode", "room")).lower()
+            if mode == "strict":
+                detector.score_threshold = 0.70
+                detector.tracker.min_confirm_frames = 6
+            elif mode == "high":
+                detector.score_threshold = 0.48
+                detector.tracker.min_confirm_frames = 3
+            else:
+                detector.score_threshold = 0.62
+                detector.tracker.min_confirm_frames = 5
+        elif action == "set_speech_cooldown":
+            sec = float(cmd.get("sec", 30.0))
+            speaker.cooldown_sec = max(5.0, min(300.0, sec))
         elif action == "toggle_auto_speak":
             speaker.auto_speak = not speaker.auto_speak
         elif action == "preset_audio":

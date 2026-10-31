@@ -124,46 +124,76 @@ def _iou(a: Detection, b: Detection) -> float:
 
 
 class CentroidTracker:
-    """Lightweight IoU + centroid tracker to preserve target IDs across frames."""
+    """IoU + centroid tracker with multi-frame confirmation and coordinate smoothing."""
 
-    def __init__(self, max_age_sec: float = 1.2) -> None:
+    def __init__(
+        self,
+        max_age_sec: float = 0.75,
+        min_confirm_frames: int = 5,
+        ema_alpha: float = 0.48,
+    ) -> None:
         self.max_age_sec = max_age_sec
+        self.min_confirm_frames = min_confirm_frames
+        self.ema_alpha = ema_alpha
         self._next_id = 1
-        self._tracks: dict[int, tuple[Detection, float]] = {}
+        # tid -> (Detection, last_seen_ts, confirm_hits)
+        self._tracks: dict[int, tuple[Detection, float, int]] = {}
 
     def update(self, detections: list[Detection]) -> list[Detection]:
         now = time.monotonic()
-        self._tracks = {
-            tid: (det, ts)
-            for tid, (det, ts) in self._tracks.items()
-            if now - ts <= self.max_age_sec
-        }
+        # Expire stale tracks and decay hit count if not seen for > 120ms
+        cleaned: dict[int, tuple[Detection, float, int]] = {}
+        for tid, (det, ts, hits) in self._tracks.items():
+            age = now - ts
+            if age <= self.max_age_sec:
+                decayed_hits = max(1, hits - 1) if age > 0.12 else hits
+                cleaned[tid] = (det, ts, decayed_hits)
+        self._tracks = cleaned
 
         used_tracks: set[int] = set()
+        confirmed_detections: list[Detection] = []
+
         for det in detections:
             best_tid: int | None = None
             best_score = 0.0
-            for tid, (prev_det, _) in self._tracks.items():
+            for tid, (prev_det, _, _) in self._tracks.items():
                 if tid in used_tracks or prev_det.label != det.label:
                     continue
                 iou_val = _iou(det, prev_det)
                 dist = float(
                     np.hypot(det.center_x - prev_det.center_x, det.center_y - prev_det.center_y)
                 )
-                score = iou_val + max(0.0, 0.35 - dist)
-                if score > best_score and (iou_val > 0.1 or dist < 0.25):
+                score = iou_val + max(0.0, 0.30 - dist)
+                if score > best_score and (iou_val > 0.15 or dist < 0.20):
                     best_score = score
                     best_tid = tid
 
             if best_tid is None:
                 best_tid = self._next_id
                 self._next_id += 1
+                hits = 1
+            else:
+                prev_det, _, prev_hits = self._tracks[best_tid]
+                hits = min(30, prev_hits + 1)
+                # Smooth bounding box and custom aim coordinates to eliminate jitter
+                a = self.ema_alpha
+                det.xmin = a * det.xmin + (1.0 - a) * prev_det.xmin
+                det.ymin = a * det.ymin + (1.0 - a) * prev_det.ymin
+                det.xmax = a * det.xmax + (1.0 - a) * prev_det.xmax
+                det.ymax = a * det.ymax + (1.0 - a) * prev_det.ymax
+                if det.custom_aim_x is not None and prev_det.custom_aim_x is not None:
+                    det.custom_aim_x = a * det.custom_aim_x + (1.0 - a) * prev_det.custom_aim_x
+                if det.custom_aim_y is not None and prev_det.custom_aim_y is not None:
+                    det.custom_aim_y = a * det.custom_aim_y + (1.0 - a) * prev_det.custom_aim_y
 
             det.track_id = best_tid
             used_tracks.add(best_tid)
-            self._tracks[best_tid] = (det, now)
+            self._tracks[best_tid] = (det, now, hits)
 
-        return detections
+            if hits >= self.min_confirm_frames:
+                confirmed_detections.append(det)
+
+        return confirmed_detections
 
 
 class FaceUpperBodyAnalyzer:
@@ -191,8 +221,9 @@ class FaceUpperBodyAnalyzer:
         want_frontal: bool,
         want_side: bool,
         want_upper: bool,
-    ) -> list[Detection]:
-        """Extract frontal face, side face, and upper body detections within a person bbox."""
+        min_upper_conf: float = 0.68,
+    ) -> tuple[list[Detection], bool]:
+        """Extract verified frontal face, side face, and upper body detections within a person bbox."""
         sub_dets: list[Detection] = []
         fh, fw = gray_frame.shape[:2]
 
@@ -202,15 +233,16 @@ class FaceUpperBodyAnalyzer:
         py2 = int(person_det.ymax * fh)
         pw = px2 - px1
         ph = py2 - py1
-        if pw < 36 or ph < 48:
-            return sub_dets
+        # Reject tiny distant clutter or wide horizontal furniture shapes (e.g. sofas/tables)
+        if pw < 64 or ph < 84 or person_det.area_ratio < 0.016 or pw > ph * 1.38:
+            return sub_dets, False
 
-        # Only scan upper 60% of person box for faces to keep CPU time < 1.5ms
+        # Scan upper 62% of person box for faces
         head_y2 = py1 + int(ph * 0.62)
         roi = gray_frame[py1:head_y2, px1:px2]
         rh, rw = roi.shape[:2]
-        if rw < 24 or rh < 24:
-            return sub_dets
+        if rw < 32 or rh < 32:
+            return sub_dets, False
 
         # Downscale wide ROIs to max 220px width for fast Haar cascade evaluation
         scale = min(1.0, 220.0 / float(rw))
@@ -221,12 +253,11 @@ class FaceUpperBodyAnalyzer:
 
         face_found: Detection | None = None
 
-        if (want_frontal or True) and self.frontal_clf is not None:
+        if self.frontal_clf is not None:
             faces = self.frontal_clf.detectMultiScale(
-                small, scaleFactor=1.18, minNeighbors=4, minSize=(22, 22)
+                small, scaleFactor=1.16, minNeighbors=6, minSize=(28, 28)
             )
             if len(faces) > 0:
-                # Pick largest frontal face
                 fx, fy, f_w, f_h = max(faces, key=lambda b: b[2] * b[3])
                 xmin = (px1 + fx / scale) / fw
                 ymin = (py1 + fy / scale) / fh
@@ -243,10 +274,9 @@ class FaceUpperBodyAnalyzer:
                 if want_frontal:
                     sub_dets.append(face_found)
 
-        if face_found is None and (want_side or True) and self.profile_clf is not None:
-            # Check left-facing profile
+        if face_found is None and self.profile_clf is not None:
             profiles = self.profile_clf.detectMultiScale(
-                small, scaleFactor=1.18, minNeighbors=4, minSize=(22, 22)
+                small, scaleFactor=1.16, minNeighbors=6, minSize=(28, 28)
             )
             if len(profiles) > 0:
                 fx, fy, f_w, f_h = max(profiles, key=lambda b: b[2] * b[3])
@@ -263,10 +293,9 @@ class FaceUpperBodyAnalyzer:
                     ymax=max(0.0, min(1.0, ymax)),
                 )
             else:
-                # Check right-facing profile on horizontally flipped ROI
                 flipped = cv2.flip(small, 1)
                 profiles_r = self.profile_clf.detectMultiScale(
-                    flipped, scaleFactor=1.18, minNeighbors=4, minSize=(22, 22)
+                    flipped, scaleFactor=1.16, minNeighbors=6, minSize=(28, 28)
                 )
                 if len(profiles_r) > 0:
                     fx, fy, f_w, f_h = max(profiles_r, key=lambda b: b[2] * b[3])
@@ -291,8 +320,15 @@ class FaceUpperBodyAnalyzer:
             person_det.custom_aim_x = face_found.center_x
             person_det.custom_aim_y = face_found.center_y
 
-        if want_upper:
-            # Upper body box: top 52% of full-body person bbox (or full box if already a close-up bust)
+        upper_verified = (face_found is not None) or (person_det.confidence >= min_upper_conf)
+        if not upper_verified and self.upper_clf is not None and sw >= 42 and sh >= 42:
+            ub_hits = self.upper_clf.detectMultiScale(
+                small, scaleFactor=1.18, minNeighbors=5, minSize=(40, 40)
+            )
+            if len(ub_hits) > 0:
+                upper_verified = True
+
+        if want_upper and upper_verified:
             aspect = ph / max(1.0, float(pw))
             ub_ratio = 0.52 if aspect > 1.25 else 0.80
             ub_ymax = person_det.ymin + (person_det.ymax - person_det.ymin) * ub_ratio
@@ -308,7 +344,7 @@ class FaceUpperBodyAnalyzer:
             )
             sub_dets.append(ub_det)
 
-        return sub_dets
+        return sub_dets, upper_verified
 
 
 class HailoDetector:
@@ -317,7 +353,7 @@ class HailoDetector:
     def __init__(
         self,
         hef_path: str | Path,
-        score_threshold: float = 0.45,
+        score_threshold: float = 0.62,
         target_classes: Iterable[str] | None = DEFAULT_PANEL_CLASSES,
     ) -> None:
         self.hef_path = Path(hef_path)
@@ -445,20 +481,22 @@ class HailoDetector:
                 )
                 if label == "person":
                     person_candidates.append(det)
-                else:
+                elif det.area_ratio >= 0.012:
                     detections.append(det)
 
         if person_candidates:
             gray = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2GRAY)
+            min_upper_conf = max(self.score_threshold, 0.68)
             for p_det in person_candidates:
-                sub_dets = self.face_analyzer.analyze_person(
+                sub_dets, upper_verified = self.face_analyzer.analyze_person(
                     gray_frame=gray,
                     person_det=p_det,
                     want_frontal=want_frontal,
                     want_side=want_side,
                     want_upper=want_upper,
+                    min_upper_conf=min_upper_conf,
                 )
-                if want_person:
+                if want_person and upper_verified:
                     detections.append(p_det)
                 detections.extend(sub_dets)
 

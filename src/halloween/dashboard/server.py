@@ -303,6 +303,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
       </div>
 
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:10px; padding:8px; background:#12121b; border:1px solid #28283a; border-radius:6px;">
+        <div>
+          <div style="font-size:0.72rem; color:var(--muted); margin-bottom:4px; font-weight:600;">🎯 Detection Sensitivity (Room Filter)</div>
+          <select id="sensSel" onchange="sendCtrl({action:'set_sensitivity', mode:this.value})" style="padding:5px 8px; font-size:0.78rem;">
+            <option value="strict">Strict Room (70% Conf / 6-Frame Lock)</option>
+            <option value="room" selected>Furnished Room (62% Conf / 5-Frame Lock)</option>
+            <option value="high">High Sensitivity (48% Conf / 3-Frame Lock)</option>
+          </select>
+        </div>
+        <div>
+          <div style="font-size:0.72rem; color:var(--muted); margin-bottom:4px; font-weight:600;">⏱️ Auto-Speech Cooldown</div>
+          <select id="cooldownSel" onchange="sendCtrl({action:'set_speech_cooldown', sec:parseFloat(this.value)})" style="padding:5px 8px; font-size:0.78rem;">
+            <option value="15">Every 15s (Frequent)</option>
+            <option value="30" selected>Every 30s (Balanced)</option>
+            <option value="60">Every 60s (Calm)</option>
+            <option value="120">Every 120s (Rare)</option>
+          </select>
+        </div>
+      </div>
+
       <div class="obj-group">
         <div class="obj-group-title">1. Person & Face (Gaze locks onto Face / Eyes)</div>
         <div class="chip-row">
