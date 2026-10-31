@@ -223,3 +223,21 @@ class PiconZeroClient:
             return True
         except OSError:
             return False
+
+    def stop_audio(self, alsa_device: str = "plughw:1,0", jaw_closed: int = 85) -> bool:
+        """Immediately interrupt any playing WAV on RPi4 and return jaw to closed angle."""
+        import io
+        import wave
+
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(22050)
+            w.writeframes(b"\x00\x00" * 220)
+        return self.play_wav_with_jaw(
+            wav_bytes=buf.getvalue(),
+            alsa_device=alsa_device,
+            jaw_closed=jaw_closed,
+            jaw_open=jaw_closed,
+        )

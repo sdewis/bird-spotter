@@ -207,6 +207,20 @@ def run_tracker(cfg: dict, duration_sec: float | None = None) -> int:
             mood_str = str(cmd.get("mood", "MENACING")).upper()
             mood_val = Mood(mood_str) if mood_str in Mood.__members__ else Mood.MENACING
             speaker.speak_async(text, mood_val)
+        elif action == "preview_phrase":
+            phrase_data = cmd.get("phrase")
+            if isinstance(phrase_data, dict):
+                speaker.speak_phrase_async(phrase_data)
+        elif action == "stop_audio":
+            speaker.stop_playback()
+        elif action == "save_phrase":
+            phrase_data = cmd.get("phrase")
+            if isinstance(phrase_data, dict):
+                speaker.upsert_phrase(phrase_data)
+        elif action == "delete_phrase":
+            pid = str(cmd.get("id", "")).strip()
+            if pid:
+                speaker.delete_phrase(pid)
         elif action == "pi2_init":
             threading.Thread(target=servo_client.send_startup_init, daemon=True).start()
         elif action == "pi2_standby":
@@ -362,6 +376,8 @@ def run_tracker(cfg: dict, duration_sec: float | None = None) -> int:
                     "filter_target_classes": detector.filter_target_classes,
                     "enabled_classes": sorted(detector.enabled_classes),
                     "auto_speak": speaker.auto_speak,
+                    "is_playing": speaker.is_playing,
+                    "phrases": speaker.phrases,
                     "last_spoken_text": speaker.last_spoken_text,
                     "last_spoken_mood": speaker.last_spoken_mood,
                     "pi2_online": servo_client.pi2_online,

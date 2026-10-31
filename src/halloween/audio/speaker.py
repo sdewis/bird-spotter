@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from typing import Any
 import wave
 
 import numpy as np
@@ -21,6 +22,7 @@ from halloween.servos.client import PiconZeroClient
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 PIPER_BIN = PROJECT_ROOT / "models" / "piper" / "piper"
 PIPER_MODEL = PROJECT_ROOT / "models" / "piper" / "en_GB-aru-medium.onnx"
+DIALOGUE_PATH = PROJECT_ROOT / "config" / "dialogue.json"
 # Speaker "01" in en_GB-aru-medium maps to speaker_id 3 ("01(3)")
 DEFAULT_PIPER_SPEAKER_ID = 3
 
@@ -177,6 +179,67 @@ def _espeak_raw_samples(text: str, voice: str, pitch: int, speed: int) -> tuple[
     return samples, sr
 
 
+_PAUSE_TOKEN_RE = re.compile(
+    r"(\[\s*\d+(?:\.\d+)?\s*(?:ms|s)?\s*\]|\[\s*pause\s*\]|\.{2,}|,{2,}|-{2,})",
+    re.IGNORECASE,
+)
+
+
+def _parse_pause_duration(token: str) -> float:
+    """Convert a pause marker ('...', ',,,', '--', '[0.8s]', '[500ms]', '[pause]') into seconds."""
+    t = token.strip().lower()
+    if t.startswith("[") and t.endswith("]"):
+        inner = t[1:-1].strip()
+        if inner == "pause":
+            return 0.65
+        if inner.endswith("ms"):
+            return max(0.05, min(5.0, float(inner[:-2].strip()) / 1000.0))
+        if inner.endswith("s"):
+            inner = inner[:-1].strip()
+        try:
+            return max(0.05, min(5.0, float(inner)))
+        except ValueError:
+            return 0.5
+    if t.startswith("."):
+        # '...' = 0.60s, '....' = 0.85s, etc.
+        return min(4.0, 0.35 + 0.25 * max(0, len(t) - 2))
+    if t.startswith(","):
+        # ',,' = 0.40s, ',,,' = 0.62s, etc.
+        return min(4.0, 0.40 + 0.22 * max(0, len(t) - 2))
+    if t.startswith("-"):
+        return min(4.0, 0.35 + 0.20 * max(0, len(t) - 2))
+    return 0.4
+
+
+def _trim_silence(samples: np.ndarray, threshold: float = 220.0) -> np.ndarray:
+    """Trim dead leading and trailing silence around an utterance."""
+    active = np.flatnonzero(np.abs(samples) > threshold)
+    if len(active) == 0:
+        return samples[:0]
+    start = max(0, int(active[0]) - 140)
+    end = min(len(samples), int(active[-1]) + 240)
+    return samples[start:end]
+
+
+def _single_tts_samples(
+    text: str,
+    speaker_id: int = DEFAULT_PIPER_SPEAKER_ID,
+    fallback_voice: str = "en-gb+f3",
+    fallback_pitch: int = 80,
+    fallback_speed: int = 160,
+) -> tuple[np.ndarray, int]:
+    if _PIPER.is_available():
+        try:
+            s, sr = _PIPER.synthesize_samples(text, speaker_id=speaker_id)
+            return _trim_silence(s), sr
+        except Exception as exc:
+            print(f"[PiperTTS] Fallback to espeak-ng due to: {exc}")
+    s, sr = _espeak_raw_samples(
+        text, voice=fallback_voice, pitch=fallback_pitch, speed=fallback_speed
+    )
+    return _trim_silence(s), sr
+
+
 def _tts_samples(
     text: str,
     speaker_id: int = DEFAULT_PIPER_SPEAKER_ID,
@@ -184,15 +247,31 @@ def _tts_samples(
     fallback_pitch: int = 80,
     fallback_speed: int = 160,
 ) -> tuple[np.ndarray, int]:
-    """Synthesize with Piper en_GB-aru-medium (default speaker 01(3)), falling back to espeak-ng."""
-    if _PIPER.is_available():
-        try:
-            return _PIPER.synthesize_samples(text, speaker_id=speaker_id)
-        except Exception as exc:
-            print(f"[PiperTTS] Fallback to espeak-ng due to: {exc}")
-    return _espeak_raw_samples(
-        text, voice=fallback_voice, pitch=fallback_pitch, speed=fallback_speed
-    )
+    """Synthesize with Piper en_GB-aru-medium, honoring '...', ',,,', '--', and '[0.8s]' pauses."""
+    parts = _PAUSE_TOKEN_RE.split(text)
+    if len(parts) <= 1:
+        return _single_tts_samples(
+            text, speaker_id, fallback_voice, fallback_pitch, fallback_speed
+        )
+
+    out_chunks: list[np.ndarray] = []
+    sr = 22050
+    for part in parts:
+        if not part or not part.strip():
+            continue
+        if _PAUSE_TOKEN_RE.fullmatch(part):
+            dur = _parse_pause_duration(part)
+            out_chunks.append(np.zeros(int(sr * dur), dtype=np.float32))
+        else:
+            trimmed, sr = _single_tts_samples(
+                part.strip(), speaker_id, fallback_voice, fallback_pitch, fallback_speed
+            )
+            if len(trimmed) > 0:
+                out_chunks.append(trimmed)
+
+    if not out_chunks:
+        return np.zeros(1000, dtype=np.float32), sr
+    return np.concatenate(out_chunks), sr
 
 
 def _samples_to_wav_bytes(samples: np.ndarray, sr: int) -> bytes:
@@ -209,7 +288,7 @@ def _samples_to_wav_bytes(samples: np.ndarray, sr: int) -> bytes:
 
 def _split_chaotic_chunks(text: str) -> list[tuple[str, bool]]:
     """Split text into clauses (or 3-5 word groups if a single long sentence) for chaotic voice switching."""
-    raw_clauses = [c.strip() for c in re.findall(r"[^!?;.]+[!?;.]*", text) if c.strip()]
+    raw_clauses = [c.strip() for c in re.findall(r"[^!?;]+[!?;]*", text) if c.strip()]
     if not raw_clauses:
         return [(text.strip(), True)]
 
@@ -233,22 +312,11 @@ def _split_chaotic_chunks(text: str) -> list[tuple[str, bool]]:
     return chunks
 
 
-def _trim_silence(samples: np.ndarray, threshold: float = 220.0) -> np.ndarray:
-    """Trim dead leading and trailing silence around an utterance."""
-    active = np.flatnonzero(np.abs(samples) > threshold)
-    if len(active) == 0:
-        return samples[:0]
-    start = max(0, int(active[0]) - 140)
-    end = min(len(samples), int(active[-1]) + 240)
-    return samples[start:end]
-
-
 def _synthesize_chaotic_chunk(chunk_text: str, persona: str) -> tuple[np.ndarray, int]:
     """Synthesize a single chunk using Piper en_GB-aru-medium 01(3) & alternating personas."""
     if persona == "sweet_high":
         # Natural Piper en_GB-aru-medium speaker 01(3) with bright presence
-        raw, sr = _tts_samples(chunk_text, speaker_id=DEFAULT_PIPER_SPEAKER_ID)
-        trimmed = _trim_silence(raw)
+        trimmed, sr = _tts_samples(chunk_text, speaker_id=DEFAULT_PIPER_SPEAKER_ID)
         d = int(sr * 0.020)
         out = np.zeros(len(trimmed) + d, dtype=np.float32)
         out[: len(trimmed)] += trimmed
@@ -257,8 +325,7 @@ def _synthesize_chaotic_chunk(chunk_text: str, persona: str) -> tuple[np.ndarray
 
     if persona == "demon_deep":
         # Piper en_GB-aru-medium 01(3) pitch-shifted into deep demonic register + crypt echo (+25%)
-        raw, sr = _tts_samples(chunk_text, speaker_id=DEFAULT_PIPER_SPEAKER_ID)
-        trimmed = _trim_silence(raw)
+        trimmed, sr = _tts_samples(chunk_text, speaker_id=DEFAULT_PIPER_SPEAKER_ID)
         if len(trimmed) > 0:
             idx = np.arange(0, len(trimmed), 0.80)
             pitched = np.interp(idx, np.arange(len(trimmed)), trimmed).astype(np.float32)
@@ -273,8 +340,7 @@ def _synthesize_chaotic_chunk(chunk_text: str, persona: str) -> tuple[np.ndarray
 
     if persona == "manic_goblin":
         # Alternating aru speaker (id=1 / "06") pitched up slightly for manic contrast
-        raw, sr = _tts_samples(chunk_text, speaker_id=1)
-        trimmed = _trim_silence(raw)
+        trimmed, sr = _tts_samples(chunk_text, speaker_id=1)
         if len(trimmed) > 0:
             idx = np.arange(0, len(trimmed), 1.12)
             pitched = np.interp(idx, np.arange(len(trimmed)), trimmed).astype(np.float32)
@@ -283,8 +349,7 @@ def _synthesize_chaotic_chunk(chunk_text: str, persona: str) -> tuple[np.ndarray
         return pitched * 0.95, sr
 
     # "crypt_growl": Alternating aru speaker (id=5 / "08") pitched down with dark echo (+25%)
-    raw, sr = _tts_samples(chunk_text, speaker_id=5)
-    trimmed = _trim_silence(raw)
+    trimmed, sr = _tts_samples(chunk_text, speaker_id=5)
     if len(trimmed) > 0:
         idx = np.arange(0, len(trimmed), 0.86)
         pitched = np.interp(idx, np.arange(len(trimmed)), trimmed).astype(np.float32)
@@ -348,6 +413,342 @@ def synthesize_bipolar_wav(text: str, mood: Mood) -> bytes:
     return _samples_to_wav_bytes(out * 0.93, sr)
 
 
+DEFAULT_DIALOGUE_PHRASES: list[dict[str, Any]] = [
+    {
+        "id": "sweet_1",
+        "title": "Warm Porch Welcome",
+        "mood": "SWEET",
+        "text": SWEET_HUMAN_LINES[0],
+        "pitch_scale": 1.00,
+        "echo_wet": 0.18,
+        "echo_delay_ms": 20,
+        "gain": 0.96,
+        "speaker_id": 3,
+    },
+    {
+        "id": "sweet_2",
+        "title": "Delightful Costume",
+        "mood": "SWEET",
+        "text": SWEET_HUMAN_LINES[1],
+        "pitch_scale": 1.00,
+        "echo_wet": 0.18,
+        "echo_delay_ms": 20,
+        "gain": 0.96,
+        "speaker_id": 3,
+    },
+    {
+        "id": "sweet_3",
+        "title": "Promise I Don't Bite",
+        "mood": "SWEET",
+        "text": SWEET_HUMAN_LINES[2],
+        "pitch_scale": 1.00,
+        "echo_wet": 0.18,
+        "echo_delay_ms": 20,
+        "gain": 0.96,
+        "speaker_id": 3,
+    },
+    {
+        "id": "sweet_4",
+        "title": "Lonely Porch Host",
+        "mood": "SWEET",
+        "text": SWEET_HUMAN_LINES[3],
+        "pitch_scale": 1.00,
+        "echo_wet": 0.18,
+        "echo_delay_ms": 20,
+        "gain": 0.96,
+        "speaker_id": 3,
+    },
+    {
+        "id": "sweet_5",
+        "title": "Looking Fabulous",
+        "mood": "SWEET",
+        "text": SWEET_HUMAN_LINES[4],
+        "pitch_scale": 1.00,
+        "echo_wet": 0.18,
+        "echo_delay_ms": 20,
+        "gain": 0.96,
+        "speaker_id": 3,
+    },
+    {
+        "id": "pet_1",
+        "title": "Precious Furry Friend",
+        "mood": "SWEET_PET",
+        "text": SWEET_PET_LINES[0],
+        "pitch_scale": 1.03,
+        "echo_wet": 0.18,
+        "echo_delay_ms": 20,
+        "gain": 0.96,
+        "speaker_id": 3,
+    },
+    {
+        "id": "pet_2",
+        "title": "Animal Visitor Greeting",
+        "mood": "SWEET_PET",
+        "text": SWEET_PET_LINES[1],
+        "pitch_scale": 1.03,
+        "echo_wet": 0.18,
+        "echo_delay_ms": 20,
+        "gain": 0.96,
+        "speaker_id": 3,
+    },
+    {
+        "id": "pet_3",
+        "title": "Adorable Ears",
+        "mood": "SWEET_PET",
+        "text": SWEET_PET_LINES[2],
+        "pitch_scale": 1.03,
+        "echo_wet": 0.18,
+        "echo_delay_ms": 20,
+        "gain": 0.96,
+        "speaker_id": 3,
+    },
+    {
+        "id": "menacing_1",
+        "title": "Step Back From My Crypt",
+        "mood": "MENACING",
+        "text": MENACING_LOOMING_LINES[0],
+        "pitch_scale": 0.82,
+        "echo_wet": 0.48,
+        "echo_delay_ms": 75,
+        "gain": 0.93,
+        "speaker_id": 3,
+    },
+    {
+        "id": "menacing_2",
+        "title": "Jaw Snaps Shut",
+        "mood": "MENACING",
+        "text": MENACING_LOOMING_LINES[1],
+        "pitch_scale": 0.82,
+        "echo_wet": 0.48,
+        "echo_delay_ms": 75,
+        "gain": 0.93,
+        "speaker_id": 3,
+    },
+    {
+        "id": "menacing_3",
+        "title": "Smell Your Fear",
+        "mood": "MENACING",
+        "text": MENACING_LOOMING_LINES[2],
+        "pitch_scale": 0.82,
+        "echo_wet": 0.48,
+        "echo_delay_ms": 75,
+        "gain": 0.93,
+        "speaker_id": 3,
+    },
+    {
+        "id": "menacing_4",
+        "title": "Join Skeleton Crew",
+        "mood": "MENACING",
+        "text": MENACING_LOOMING_LINES[3],
+        "pitch_scale": 0.82,
+        "echo_wet": 0.48,
+        "echo_delay_ms": 75,
+        "gain": 0.93,
+        "speaker_id": 3,
+    },
+    {
+        "id": "menacing_5",
+        "title": "Locked Onto Your Soul",
+        "mood": "MENACING",
+        "text": MENACING_LOOMING_LINES[4],
+        "pitch_scale": 0.82,
+        "echo_wet": 0.48,
+        "echo_delay_ms": 75,
+        "gain": 0.93,
+        "speaker_id": 3,
+    },
+    {
+        "id": "menacing_6",
+        "title": "Lurking in Shadows",
+        "mood": "MENACING",
+        "text": MENACING_GENERAL_LINES[0],
+        "pitch_scale": 0.82,
+        "echo_wet": 0.48,
+        "echo_delay_ms": 75,
+        "gain": 0.93,
+        "speaker_id": 3,
+    },
+    {
+        "id": "menacing_7",
+        "title": "Greedy Mortal",
+        "mood": "MENACING",
+        "text": MENACING_GENERAL_LINES[1],
+        "pitch_scale": 0.82,
+        "echo_wet": 0.48,
+        "echo_delay_ms": 75,
+        "gain": 0.93,
+        "speaker_id": 3,
+    },
+    {
+        "id": "menacing_8",
+        "title": "Claim Your Shoes",
+        "mood": "MENACING",
+        "text": MENACING_GENERAL_LINES[2],
+        "pitch_scale": 0.82,
+        "echo_wet": 0.48,
+        "echo_delay_ms": 75,
+        "gain": 0.93,
+        "speaker_id": 3,
+    },
+    {
+        "id": "menacing_9",
+        "title": "Bare Skull Roast",
+        "mood": "MENACING",
+        "text": MENACING_GENERAL_LINES[3],
+        "pitch_scale": 0.82,
+        "echo_wet": 0.48,
+        "echo_delay_ms": 75,
+        "gain": 0.93,
+        "speaker_id": 3,
+    },
+    {
+        "id": "menacing_laugh",
+        "title": "Evil Crypt Laugh",
+        "mood": "MENACING",
+        "text": "Mwa ha ha ha ha haaa! Welcome to your doom, mortals! Ha ha ha ha!",
+        "pitch_scale": 0.80,
+        "echo_wet": 0.55,
+        "echo_delay_ms": 85,
+        "gain": 0.95,
+        "speaker_id": 3,
+    },
+    {
+        "id": "chaotic_1",
+        "title": "Surrounded Argument",
+        "mood": "CHAOTIC",
+        "text": CHAOTIC_CROWD_LINES[0],
+        "pitch_scale": 1.00,
+        "echo_wet": 0.45,
+        "echo_delay_ms": 70,
+        "gain": 0.95,
+        "speaker_id": 3,
+    },
+    {
+        "id": "chaotic_2",
+        "title": "Bite Their Ankles",
+        "mood": "CHAOTIC",
+        "text": CHAOTIC_CROWD_LINES[1],
+        "pitch_scale": 1.00,
+        "echo_wet": 0.45,
+        "echo_delay_ms": 70,
+        "gain": 0.95,
+        "speaker_id": 3,
+    },
+    {
+        "id": "chaotic_3",
+        "title": "Who Is In Charge",
+        "mood": "CHAOTIC",
+        "text": CHAOTIC_CROWD_LINES[2],
+        "pitch_scale": 1.00,
+        "echo_wet": 0.45,
+        "echo_delay_ms": 70,
+        "gain": 0.95,
+        "speaker_id": 3,
+    },
+    {
+        "id": "chaotic_4",
+        "title": "Make Up Our Mind",
+        "mood": "CHAOTIC",
+        "text": CHAOTIC_CROWD_LINES[3],
+        "pitch_scale": 1.00,
+        "echo_wet": 0.45,
+        "echo_delay_ms": 70,
+        "gain": 0.95,
+        "speaker_id": 3,
+    },
+]
+
+
+def load_dialogue_phrases() -> list[dict[str, Any]]:
+    """Load dialogue phrases and per-phrase DSP settings from config/dialogue.json."""
+    if DIALOGUE_PATH.is_file():
+        try:
+            with open(DIALOGUE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list) and len(data) > 0:
+                return data
+        except (OSError, json.JSONDecodeError):
+            pass
+    phrases = [dict(p) for p in DEFAULT_DIALOGUE_PHRASES]
+    save_dialogue_phrases(phrases)
+    return phrases
+
+
+def save_dialogue_phrases(phrases: list[dict[str, Any]]) -> None:
+    """Persist dialogue phrases and per-phrase DSP settings to config/dialogue.json."""
+    try:
+        DIALOGUE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(DIALOGUE_PATH, "w", encoding="utf-8") as f:
+            json.dump(phrases, f, indent=2)
+    except OSError as exc:
+        print(f"[BipolarSpeaker] Failed to save dialogue.json: {exc}")
+
+
+def synthesize_phrase_wav(phrase: dict[str, Any]) -> bytes:
+    """Synthesize a dialogue phrase applying its individual slider effects."""
+    text = str(phrase.get("text", "")).strip()
+    mood_str = str(phrase.get("mood", "MENACING")).upper()
+    pitch_scale = max(0.55, min(1.45, float(phrase.get("pitch_scale", 1.0))))
+    echo_wet = max(0.0, min(1.0, float(phrase.get("echo_wet", 0.35))))
+    echo_delay_ms = max(10, min(220, int(phrase.get("echo_delay_ms", 65))))
+    gain = max(0.2, min(1.6, float(phrase.get("gain", 0.95))))
+    speaker_id = max(0, min(11, int(phrase.get("speaker_id", DEFAULT_PIPER_SPEAKER_ID))))
+
+    if mood_str == "CHAOTIC":
+        # Erratically switch voices across chunks, modulated by the phrase's custom sliders
+        chunks = _split_chaotic_chunks(text)
+        personas = ("sweet_high", "demon_deep", "manic_goblin", "crypt_growl")
+        last_persona: str | None = None
+        segments: list[np.ndarray] = []
+        sr = 22050
+
+        for chunk_text, is_clause_end in chunks:
+            choices = [p for p in personas if p != last_persona]
+            persona = random.choice(choices)
+            last_persona = persona
+            seg_samples, sr = _synthesize_chaotic_chunk(chunk_text, persona)
+            if len(seg_samples) > 0:
+                if abs(pitch_scale - 1.0) > 0.02:
+                    idx = np.arange(0, len(seg_samples), pitch_scale)
+                    seg_samples = np.interp(idx, np.arange(len(seg_samples)), seg_samples).astype(
+                        np.float32
+                    )
+                if echo_wet > 0.02:
+                    d1 = max(1, int(sr * (echo_delay_ms / 1000.0)))
+                    padded = np.zeros(len(seg_samples) + d1, dtype=np.float32)
+                    padded[: len(seg_samples)] += seg_samples
+                    padded[d1 : d1 + len(seg_samples)] += (echo_wet * 0.5) * seg_samples
+                    seg_samples = padded
+                segments.append(seg_samples * gain)
+                pause_sec = 0.075 if is_clause_end else 0.020
+                segments.append(np.zeros(int(sr * pause_sec), dtype=np.float32))
+
+        if not segments:
+            return _samples_to_wav_bytes(np.zeros(1000, dtype=np.float32), sr)
+        return _samples_to_wav_bytes(np.concatenate(segments), sr)
+
+    samples, sr = _tts_samples(text, speaker_id=speaker_id)
+    if abs(pitch_scale - 1.0) > 0.01 and len(samples) > 1:
+        idx = np.arange(0, len(samples), pitch_scale)
+        pitched = np.interp(idx, np.arange(len(samples)), samples).astype(np.float32)
+    else:
+        pitched = samples
+
+    if echo_wet > 0.01:
+        d1 = max(1, int(sr * (echo_delay_ms / 1000.0)))
+        d2 = d1 * 2
+        d3 = d1 * 3
+        out = np.zeros(len(pitched) + d3, dtype=np.float32)
+        out[: len(pitched)] += pitched
+        out[d1 : d1 + len(pitched)] += echo_wet * pitched
+        out[d2 : d2 + len(pitched)] += (echo_wet * 0.52) * pitched
+        out[d3 : d3 + len(pitched)] += (echo_wet * 0.25) * pitched
+    else:
+        out = pitched
+
+    return _samples_to_wav_bytes(out * gain, sr)
+
+
 def synthesize_bone_chatter_wav(duration_sec: float = 1.6, sr: int = 22050) -> bytes:
     """Generate a rhythmic 9 Hz bone-clacking rattle WAV that drives rapid jaw chatter."""
     total_samples = int(sr * duration_sec)
@@ -380,27 +781,120 @@ class BipolarSpeaker:
 
     last_spoken_text: str = ""
     last_spoken_mood: str = "IDLE"
+    is_playing: bool = False
+    phrases: list[dict[str, Any]] = field(default_factory=load_dialogue_phrases)
     _last_speak_ts: float = field(default=0.0, init=False, repr=False)
     _last_auto_mood: Mood = field(default=Mood.IDLE, init=False, repr=False)
     _idle_since_ts: float = field(default=0.0, init=False, repr=False)
     _lock_since_ts: float = field(default=0.0, init=False, repr=False)
+    _play_token: int = field(default=0, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self) -> None:
         _PIPER.warmup_async()
+
+    def stop_playback(self) -> None:
+        """Immediately stop any active speech or preview on RPi4 and close jaw."""
+        with self._lock:
+            self._play_token += 1
+            self.is_playing = False
+        threading.Thread(
+            target=lambda: self.servo_client.stop_audio(
+                alsa_device=self.alsa_device, jaw_closed=self.jaw_closed_deg
+            ),
+            daemon=True,
+        ).start()
+
+    def upsert_phrase(self, phrase_data: dict[str, Any]) -> dict[str, Any]:
+        """Add or update a phrase with its individual DSP slider settings and save to disk."""
+        pid = str(phrase_data.get("id", "")).strip() or f"custom_{int(time.time() * 1000)}"
+        entry = {
+            "id": pid,
+            "title": str(phrase_data.get("title", "Untitled Phrase")).strip() or "Untitled Phrase",
+            "mood": str(phrase_data.get("mood", "MENACING")).upper(),
+            "text": str(phrase_data.get("text", "")).strip(),
+            "pitch_scale": round(float(phrase_data.get("pitch_scale", 1.0)), 2),
+            "echo_wet": round(float(phrase_data.get("echo_wet", 0.35)), 2),
+            "echo_delay_ms": int(phrase_data.get("echo_delay_ms", 65)),
+            "gain": round(float(phrase_data.get("gain", 0.95)), 2),
+            "speaker_id": int(phrase_data.get("speaker_id", DEFAULT_PIPER_SPEAKER_ID)),
+        }
+        with self._lock:
+            replaced = False
+            for i, p in enumerate(self.phrases):
+                if p.get("id") == pid:
+                    self.phrases[i] = entry
+                    replaced = True
+                    break
+            if not replaced:
+                self.phrases.append(entry)
+            save_dialogue_phrases(self.phrases)
+        return entry
+
+    def delete_phrase(self, phrase_id: str) -> bool:
+        """Delete a phrase by ID and persist to config/dialogue.json."""
+        with self._lock:
+            before = len(self.phrases)
+            self.phrases = [p for p in self.phrases if p.get("id") != phrase_id]
+            if len(self.phrases) != before:
+                save_dialogue_phrases(self.phrases)
+                return True
+        return False
+
+    def speak_phrase_async(self, phrase: dict[str, Any]) -> None:
+        """Synthesize a phrase dict using its custom slider settings and stream to RPi4."""
+        text = str(phrase.get("text", "")).strip()
+        if not self.enabled or not text:
+            return
+        mood_str = str(phrase.get("mood", "MENACING")).upper()
+        display_mood = "SWEET" if mood_str == "SWEET_PET" else mood_str
+        with self._lock:
+            self._play_token += 1
+            my_token = self._play_token
+            self._last_speak_ts = time.monotonic()
+            self.last_spoken_text = text
+            self.last_spoken_mood = display_mood
+            self.is_playing = True
+
+        def _worker() -> None:
+            try:
+                wav_bytes = synthesize_phrase_wav(phrase)
+                with self._lock:
+                    if self._play_token != my_token:
+                        return
+                self.servo_client.play_wav_with_jaw(
+                    wav_bytes=wav_bytes,
+                    alsa_device=self.alsa_device,
+                    jaw_closed=self.jaw_closed_deg,
+                    jaw_open=self.jaw_open_deg,
+                )
+            except Exception as exc:
+                print(f"[BipolarSpeaker] Phrase synthesis error: {exc}")
+            finally:
+                with self._lock:
+                    if self._play_token == my_token:
+                        self.is_playing = False
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def speak_async(self, text: str, mood: Mood) -> None:
         """Synthesize text in background and send WAV to RPi2 for playback + jaw sync."""
         if not self.enabled or not text.strip():
             return
         with self._lock:
+            self._play_token += 1
+            my_token = self._play_token
             self._last_speak_ts = time.monotonic()
             self.last_spoken_text = text.strip()
             self.last_spoken_mood = mood.value
+            self.is_playing = True
 
         def _worker() -> None:
             try:
                 wav_bytes = synthesize_bipolar_wav(text, mood)
+                with self._lock:
+                    if self._play_token != my_token:
+                        return
                 self.servo_client.play_wav_with_jaw(
                     wav_bytes=wav_bytes,
                     alsa_device=self.alsa_device,
@@ -409,26 +903,59 @@ class BipolarSpeaker:
                 )
             except Exception as exc:
                 print(f"[BipolarSpeaker] Speech synthesis error: {exc}")
+            finally:
+                with self._lock:
+                    if self._play_token == my_token:
+                        self.is_playing = False
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def _pick_phrase_by_mood(self, category: str) -> dict[str, Any] | None:
+        with self._lock:
+            matches = [p for p in self.phrases if str(p.get("mood", "")).upper() == category.upper()]
+            if not matches and category.upper() == "SWEET_PET":
+                matches = [p for p in self.phrases if str(p.get("mood", "")).upper() == "SWEET"]
+            return random.choice(matches) if matches else None
 
     def trigger_preset(self, preset: str) -> None:
         """Trigger a manual soundboard preset from the web dashboard."""
         if preset == "sweet":
-            self.speak_async(random.choice(SWEET_HUMAN_LINES), Mood.SWEET)
+            p = self._pick_phrase_by_mood("SWEET")
+            if p:
+                self.speak_phrase_async(p)
+            else:
+                self.speak_async(random.choice(SWEET_HUMAN_LINES), Mood.SWEET)
         elif preset == "pet":
-            self.speak_async(random.choice(SWEET_PET_LINES), Mood.SWEET)
+            p = self._pick_phrase_by_mood("SWEET_PET")
+            if p:
+                self.speak_phrase_async(p)
+            else:
+                self.speak_async(random.choice(SWEET_PET_LINES), Mood.SWEET)
         elif preset == "menacing":
-            self.speak_async(random.choice(MENACING_LOOMING_LINES), Mood.MENACING)
+            p = self._pick_phrase_by_mood("MENACING")
+            if p:
+                self.speak_phrase_async(p)
+            else:
+                self.speak_async(random.choice(MENACING_LOOMING_LINES), Mood.MENACING)
         elif preset == "chaotic":
-            self.speak_async(random.choice(CHAOTIC_CROWD_LINES), Mood.CHAOTIC)
+            p = self._pick_phrase_by_mood("CHAOTIC")
+            if p:
+                self.speak_phrase_async(p)
+            else:
+                self.speak_async(random.choice(CHAOTIC_CROWD_LINES), Mood.CHAOTIC)
         elif preset == "laugh":
-            self.speak_async(
-                "Mwa ha ha ha ha haaa! Welcome to your doom, mortals! Ha ha ha ha!",
-                Mood.MENACING,
-            )
+            with self._lock:
+                laugh_matches = [p for p in self.phrases if p.get("id") == "menacing_laugh"]
+            if laugh_matches:
+                self.speak_phrase_async(laugh_matches[0])
+            else:
+                self.speak_async(
+                    "Mwa ha ha ha ha haaa! Welcome to your doom, mortals! Ha ha ha ha!",
+                    Mood.MENACING,
+                )
         elif preset == "chatter":
             with self._lock:
+                self._play_token += 1
                 self._last_speak_ts = time.monotonic()
                 self.last_spoken_text = "*Bone Jaw Chatter*"
                 self.last_spoken_mood = "CHAOTIC"
@@ -485,16 +1012,14 @@ class BipolarSpeaker:
 
         self._last_auto_mood = mood
         if mood == Mood.CHAOTIC:
-            line = random.choice(CHAOTIC_CROWD_LINES)
+            cat = "CHAOTIC"
         elif mood == Mood.MENACING:
-            if area_ratio >= looming_threshold:
-                line = random.choice(MENACING_LOOMING_LINES)
-            else:
-                line = random.choice(MENACING_GENERAL_LINES)
+            cat = "MENACING"
         else:
-            if target_label in ("cat", "dog", "bird"):
-                line = random.choice(SWEET_PET_LINES)
-            else:
-                line = random.choice(SWEET_HUMAN_LINES)
+            cat = "SWEET_PET" if target_label in ("cat", "dog", "bird") else "SWEET"
 
-        self.speak_async(line, mood)
+        chosen = self._pick_phrase_by_mood(cat)
+        if chosen is not None:
+            self.speak_phrase_async(chosen)
+        else:
+            self.speak_async(random.choice(SWEET_HUMAN_LINES), mood)
