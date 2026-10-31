@@ -1,0 +1,68 @@
+[camera]
+device = "/dev/video0"
+width = 1280
+height = 720
+fps = 30
+format = "MJPG"
+
+[camera.ptz]
+enabled = true
+# UVC absolute pan/tilt limits verified via v4l2-ctl on OBSBOT Tiny SE
+pan_min = -468000
+pan_max = 468000
+pan_step = 3600
+tilt_min = -324000
+tilt_max = 324000
+tilt_step = 3600
+deadzone_norm = 0.08
+kp_pan = 45000.0
+kp_tilt = 35000.0
+invert_pan = true
+invert_tilt = true
+
+[hailo]
+hef_path = "/usr/share/hailo-models/yolov8s_h8.hef"
+score_threshold = 0.45
+iou_threshold = 0.45
+target_classes = [
+    "person", "upper body", "frontal face", "side face",
+    "cat", "dog", "bird", "horse",
+    "backpack", "umbrella",
+    "cell phone", "book",
+    "bottle", "wine glass", "cup", "knife", "fork", "spoon",
+    "chair", "couch", "potted plant",
+    "tv",
+    "car", "motorcycle", "truck"
+]
+
+[pi2_servos]
+enabled = true
+host = "192.168.100.125"
+port = 5555
+ssh_user = "sean"
+pan_channel = 0
+tilt_channel = 1
+jaw_channel = 2
+eyes_channel = 3
+pan_center = 90
+tilt_center = 90
+
+[personality]
+# Bipolar state triggers
+looming_bbox_area_ratio = 0.22
+crowd_threshold = 2
+mood_swing_interval_sec = 20.0
+sweet_classes = ["cat", "dog", "bird"]
+
+[audio]
+enabled = true
+auto_speak = true
+cooldown_sec = 12.0
+pi2_alsa_device = "plughw:CARD=Headphones,DEV=0"
+volume_percent = 95
+jaw_closed_deg = 85
+jaw_open_deg = 135
+
+[dashboard]
+host = "0.0.0.0"
+port = 8080

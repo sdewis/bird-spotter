@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "halloween"
+version = "0.1.0"
+description = "Interactive bipolar animatronic skull powered by RPi5 + Hailo-8, OBSBOT Tiny SE PTZ, and RPi2 Picon Zero servos."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Sean" }
+]
+dependencies = []
+
+[project.scripts]
+halloween = "halloween.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,30 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Local secrets & overrides
+.env
+config/local.toml
+
+# Runtime artifacts & recordings
+logs/
+recordings/
+*.wav
+*.mp3
+!assets/audio/*.wav
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
