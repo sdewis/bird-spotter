@@ -10,16 +10,23 @@ from typing import Any, Iterable, Iterator
 
 import cv2
 import numpy as np
-from hailo_platform import (
-    ConfigureParams,
-    FormatType,
-    HailoStreamInterface,
-    HEF,
-    InferVStreams,
-    InputVStreamParams,
-    OutputVStreamParams,
-    VDevice,
-)
+try:
+    from hailo_platform import (
+        ConfigureParams,
+        FormatType,
+        HailoStreamInterface,
+        HEF,
+        InferVStreams,
+        InputVStreamParams,
+        OutputVStreamParams,
+        VDevice,
+    )
+
+    HAILO_AVAILABLE = True
+except ImportError:
+    HAILO_AVAILABLE = False
+    ConfigureParams = FormatType = HailoStreamInterface = HEF = None  # type: ignore[assignment,misc]
+    InferVStreams = InputVStreamParams = OutputVStreamParams = VDevice = None  # type: ignore[assignment,misc]
 
 from bird_spotter.vision.classifier import BirdSpeciesClassifier, SpeciesPrediction
 
