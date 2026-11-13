@@ -40,6 +40,12 @@ class DummyPTZ(ObsbotPTZ):
         self.zoom = round(max(self.zoom_min, min(self.zoom_max, float(zoom_level))), 2)
         return True
 
+    def set_focus(self, autofocus: bool, focus_val: int | None = None) -> bool:
+        self.autofocus = bool(autofocus)
+        if focus_val is not None:
+            self.focus = max(0, min(100, int(focus_val)))
+        return True
+
 
 class TestBirdSpotter(unittest.TestCase):
     def test_database_sightings_dex_relabel_and_delete(self) -> None:

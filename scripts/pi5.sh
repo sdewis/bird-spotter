@@ -44,6 +44,7 @@ cmd_sync() {
         --exclude='venv/' \
         --exclude='__pycache__/' \
         --exclude='*.pyc' \
+        --exclude='*.egg-info/' \
         --exclude='.pytest_cache/' \
         --exclude='data/' \
         --exclude='snapshots/' \
@@ -93,7 +94,16 @@ cmd_status() {
     run_pi5 "systemctl --no-pager --full status ${PI5_SERVICE} | head -n 18" || true
     echo ""
     echo "==> Dashboard health check (${PI5_DASHBOARD_URL}):"
-    run_pi5 "curl -fsS --max-time 3 http://127.0.0.1:8080/api/state | python3 -c 'import sys, json; d=json.load(sys.stdin); print(f\"  HTTP OK | FPS: {d.get(\\\"fps\\\")} | Backend: {d.get(\\\"classifier_backend\\\")} | FSM: {d.get(\\\"fsm_state\\\")} | Solar awake: {d.get(\\\"solar\\\", {}).get(\\\"is_daylight\\\")}\")'" || echo "  Dashboard not responding on port 8080 yet."
+    curl -fsS --max-time 5 "${PI5_DASHBOARD_URL}" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+solar = d.get("solar") or {}
+print(
+    f"  HTTP OK | FPS: {d.get(\"fps\")} | Infer: {d.get(\"infer_ms\")}ms | "
+    f"Backend: {d.get(\"classifier_backend\")} | FSM: {d.get(\"fsm_state\")} | "
+    f"Solar daylight: {solar.get(\"is_daylight\")}"
+)
+' || echo "  Dashboard not responding on port 8080 yet."
 }
 
 cmd_logs() {

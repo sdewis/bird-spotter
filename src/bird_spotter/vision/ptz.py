@@ -423,17 +423,20 @@ class ObsbotPTZ:
         else:
             ctrl_str = f"focus_automatic_continuous=0,focus_absolute={f_val}"
 
-        subprocess.Popen(
-            [
-                "v4l2-ctl",
-                "-d",
-                self.device,
-                "--set-ctrl",
-                ctrl_str,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        try:
+            subprocess.Popen(
+                [
+                    "v4l2-ctl",
+                    "-d",
+                    self.device,
+                    "--set-ctrl",
+                    ctrl_str,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            return False
         return True
 
     def zoom_in(self, step: float | None = None) -> float:
