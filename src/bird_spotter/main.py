@@ -454,6 +454,7 @@ def run_spotter(cfg: dict, duration_sec: float | None = None) -> int:
     dashboard = DashboardServer(
         host=dash_cfg["host"],
         port=dash_cfg["port"],
+        snapshots_dir=snapshots_dir,
         on_control=handle_control,
         on_snapshot_requested=handle_manual_snapshot,
         on_relabel_sighting=handle_relabel,

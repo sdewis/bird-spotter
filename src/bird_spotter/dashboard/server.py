@@ -33,7 +33,7 @@ from bird_spotter.logger import spotter_log
 from bird_spotter.vision.detector import Detection
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-SNAPSHOTS_DIR = PROJECT_ROOT / "data" / "snapshots"
+SNAPSHOTS_DIR = PROJECT_ROOT / "snapshots"
 
 POPOUT_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -1795,7 +1795,14 @@ function openModalById(id) {
   resetModalZoom();
 
   document.getElementById('modalTitle').textContent = `#${item.id} — ${item.species} (${((item.species_confidence || item.yolo_confidence || 0) * 100).toFixed(0)}%)`;
-  document.getElementById('modalImg').src = '/snapshots/' + encodeURI(item.snapshot_filename || item.thumb_filename || '');
+  const snapSrc = item.snapshot_filename || item.thumb_filename || '';
+  const mImg = document.getElementById('modalImg');
+  mImg.src = snapSrc ? ('/snapshots/' + encodeURI(snapSrc)) : '';
+  mImg.onerror = function() {
+    if (item.thumb_filename && mImg.src.indexOf(encodeURI(item.thumb_filename)) === -1) {
+      mImg.src = '/snapshots/' + encodeURI(item.thumb_filename);
+    }
+  };
   document.getElementById('modalMeta').innerHTML =
     `<strong>Timestamp:</strong> ${item.timestamp || 'N/A'} &nbsp;|&nbsp; ` +
     `<strong>Scientific:</strong> <em>${item.scientific_name || 'N/A'}</em> &nbsp;|&nbsp; ` +
@@ -2024,7 +2031,7 @@ function updateUI(st) {
     dexGrid.innerHTML = dex.map(d => {
       const imgPath = d.best_thumb_filename || d.best_snapshot_filename;
       const imgHtml = imgPath
-        ? `<img src="/snapshots/${encodeURI(imgPath)}" alt="${escapeHtml(d.species)}" onclick="if(${d.best_sighting_id || 'null'}) openModalById(${d.best_sighting_id})">`
+        ? `<img src="/snapshots/${encodeURI(imgPath)}" alt="${escapeHtml(d.species)}" onerror="this.style.display='none'; if(this.nextElementSibling) this.nextElementSibling.style.display='flex';" onclick="if(${d.best_sighting_id || 'null'}) openModalById(${d.best_sighting_id})"><div style="display:none; aspect-ratio:4/3; background:#090d13; align-items:center; justify-content:center; color:var(--muted); font-size:0.8rem;">No Photo</div>`
         : `<div style="aspect-ratio:4/3; background:#090d13; display:flex; align-items:center; justify-content:center; color:var(--muted); font-size:0.8rem;">No Photo</div>`;
       return `<div class="dex-card">
         ${imgHtml}
@@ -2057,9 +2064,12 @@ function updateUI(st) {
         const thumb = s.thumb_filename || s.snapshot_filename || s.filename;
         const confPct = (((s.species_confidence || s.yolo_confidence || 0)) * 100).toFixed(0);
         const isSel = selectedCaptures.has(s.id);
+        const imgHtml = thumb
+          ? `<img src="/snapshots/${encodeURI(thumb)}" alt="${escapeHtml(s.species)}" onerror="this.style.display='none'; if(this.nextElementSibling) this.nextElementSibling.style.display='flex';"><div style="display:none; aspect-ratio:4/3; background:#090d13; align-items:center; justify-content:center; color:var(--muted); font-size:0.75rem;">No Photo</div>`
+          : `<div style="aspect-ratio:4/3; background:#090d13; display:flex; align-items:center; justify-content:center; color:var(--muted); font-size:0.75rem;">No Photo</div>`;
         return `<div class="snap-card ${isSel ? 'selected' : ''}" onclick="onSnapCardClick(event, ${s.id})">
           <input type="checkbox" class="snap-select-cb" data-id="${s.id}" ${isSel ? 'checked' : ''} onclick="event.stopPropagation(); toggleCaptureSelected(${s.id}, this.checked)">
-          <img src="/snapshots/${encodeURI(thumb)}" alt="${escapeHtml(s.species)}">
+          ${imgHtml}
           <div class="snap-card-caption">
             <strong>${escapeHtml(s.species || 'Bird')}</strong>
             <span style="color:var(--green-bright);">${confPct}%</span>
@@ -2278,6 +2288,7 @@ class DashboardServer:
     on_delete_sighting: Callable[[int], bool] | None = None
     on_delete_species: Callable[[str], int] | None = None
     get_catalog_cb: Callable[[], list[dict[str, str]]] | None = None
+    snapshots_dir: Path = field(default_factory=lambda: SNAPSHOTS_DIR)
 
     _raw_frame: np.ndarray | None = field(default=None, init=False, repr=False)
     _jpeg_bytes: bytes = field(default=b"", init=False, repr=False)
@@ -2290,8 +2301,8 @@ class DashboardServer:
     _httpd: ThreadingHTTPServer | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
-        (SNAPSHOTS_DIR / "thumbs").mkdir(parents=True, exist_ok=True)
+        self.snapshots_dir.mkdir(parents=True, exist_ok=True)
+        (self.snapshots_dir / "thumbs").mkdir(parents=True, exist_ok=True)
         self._offline_jpeg_bytes = self._create_offline_frame()
 
     def _create_offline_frame(self) -> bytes:
@@ -2340,10 +2351,47 @@ class DashboardServer:
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"bird_{ts}_manual.jpg"
-        filepath = SNAPSHOTS_DIR / filename
+        filepath = self.snapshots_dir / filename
 
         cv2.imwrite(str(filepath), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
         return filename
+
+    def _find_snapshot_file(self, rel_str: str) -> Path | None:
+        """Search for snapshot file across configured and standard snapshot directories."""
+        candidates = [
+            self.snapshots_dir,
+            PROJECT_ROOT / "snapshots",
+            PROJECT_ROOT / "data" / "snapshots",
+        ]
+        # Also check relative to current working directory
+        cwd_snap = Path.cwd() / "snapshots"
+        if cwd_snap not in candidates:
+            candidates.append(cwd_snap)
+
+        for c_dir in candidates:
+            resolved_c = c_dir.resolve()
+            p = (resolved_c / rel_str).resolve()
+            if p.is_file() and resolved_c in p.parents:
+                return p
+
+        # Fallback: if thumb requested and missing, try non-thumb, or vice-versa
+        if rel_str.startswith("thumbs/"):
+            bare = rel_str[len("thumbs/"):]
+            if bare.startswith("thumb_"):
+                bare_snap = bare.replace("thumb_", "bird_", 1)
+                for c_dir in candidates:
+                    resolved_c = c_dir.resolve()
+                    p = (resolved_c / bare_snap).resolve()
+                    if p.is_file() and resolved_c in p.parents:
+                        return p
+        elif rel_str.startswith("bird_"):
+            thumb_name = "thumbs/thumb_" + rel_str[len("bird_"):]
+            for c_dir in candidates:
+                resolved_c = c_dir.resolve()
+                p = (resolved_c / thumb_name).resolve()
+                if p.is_file() and resolved_c in p.parents:
+                    return p
+        return None
 
     def start_background(self) -> None:
         dashboard = self
@@ -2360,6 +2408,26 @@ class DashboardServer:
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+
+            def do_HEAD(self) -> None:
+                parsed = urlparse(self.path)
+                path = parsed.path
+                if path.startswith("/snapshots/"):
+                    rel_str = unquote(path[len("/snapshots/"):]).lstrip("/")
+                    found = dashboard._find_snapshot_file(rel_str)
+                    if found is not None:
+                        size = found.stat().st_size
+                        self.send_response(HTTPStatus.OK)
+                        self.send_header("Content-Type", "image/jpeg")
+                        self.send_header("Content-Length", str(size))
+                        self.send_header("Cache-Control", "public, max-age=86400")
+                        self.end_headers()
+                    else:
+                        self.send_error(HTTPStatus.NOT_FOUND)
+                else:
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
 
             def do_GET(self) -> None:
                 parsed = urlparse(self.path)
@@ -2392,15 +2460,13 @@ class DashboardServer:
                     self._send_json(cat)
                 elif path.startswith("/snapshots/"):
                     rel_str = unquote(path[len("/snapshots/"):]).lstrip("/")
-                    snap_path = (SNAPSHOTS_DIR / rel_str).resolve()
-                    if (
-                        snap_path.is_file()
-                        and SNAPSHOTS_DIR.resolve() in snap_path.parents
-                    ):
-                        img_bytes = snap_path.read_bytes()
+                    found = dashboard._find_snapshot_file(rel_str)
+                    if found is not None:
+                        img_bytes = found.read_bytes()
                         self.send_response(HTTPStatus.OK)
                         self.send_header("Content-Type", "image/jpeg")
                         self.send_header("Content-Length", str(len(img_bytes)))
+                        self.send_header("Cache-Control", "public, max-age=86400")
                         self.end_headers()
                         self.wfile.write(img_bytes)
                     else:
