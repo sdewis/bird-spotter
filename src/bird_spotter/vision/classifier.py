@@ -139,6 +139,8 @@ class BirdSpeciesClassifier:
         items = [
             {
                 "species": info["uk_name"],
+                "common_name": info["uk_name"],
+                "name": info["uk_name"],
                 "scientific_name": info["scientific_name"],
                 "category": info["category"],
             }

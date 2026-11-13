@@ -40,7 +40,8 @@ POPOUT_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Bird Spotter — Live Pop-out Feed</title>
+<title>British Bird Spotter — Live Pop-out Feed</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' fill='none'%3E%3Cdefs%3E%3ClinearGradient id='btBlue' x1='0%25' y1='0%25' x2='100%25' y2='100%25'%3E%3Cstop offset='0%25' stop-color='%2358a6ff'/%3E%3Cstop offset='100%25' stop-color='%231f6feb'/%3E%3C/linearGradient%3E%3ClinearGradient id='btYellow' x1='0%25' y1='0%25' x2='100%25' y2='100%25'%3E%3Cstop offset='0%25' stop-color='%23ffd33d'/%3E%3Cstop offset='100%25' stop-color='%23d29922'/%3E%3C/linearGradient%3E%3C/defs%3E%3Ccircle cx='32' cy='32' r='28' stroke='%2358a6ff' stroke-width='2'/%3E%3Cpath d='M12 52 Q32 50 52 53' stroke='%2330363d' stroke-width='3' stroke-linecap='round'/%3E%3Cpath d='M28 47 L27 51 M31 47 L31 51 M36 48 L36 52 M39 48 L40 52' stroke='%238b949e' stroke-width='1.8' stroke-linecap='round'/%3E%3Cpath d='M16 43 L8 53 L13 55 L21 46 Z' fill='url(%23btBlue)'/%3E%3Cpath d='M28 29 C38 29 45 33 44 44 C43 50 34 51 27 46 C24 42 24 35 28 29 Z' fill='url(%23btYellow)'/%3E%3Cpath d='M27 30 C25 39 19 46 13 44 C12 39 18 30 27 30 Z' fill='url(%23btBlue)'/%3E%3Cpath d='M18 38 L25 35' stroke='%23f0f6fc' stroke-width='2' stroke-linecap='round'/%3E%3Cpath d='M25 19 C35 21 41 20 44 17 C47 22 45 28 39 31 C32 31 25 27 25 19 Z' fill='%23f0f6fc'/%3E%3Cpath d='M28 21 Q37 23 44 20 L43 23 Q36 24 28 22 Z' fill='%23161b22'/%3E%3Cpath d='M37 29 C35 32 31 32 29 30 Z' fill='%23161b22'/%3E%3Cpath d='M25 17 C31 11 39 12 44 17 C40 20 33 20 25 17 Z' fill='url(%23btBlue)'/%3E%3Cpolygon points='44,19 52,22 44,25' fill='%2330363d'/%3Ccircle cx='36' cy='21.5' r='1.8' fill='%23161b22'/%3Ccircle cx='36.5' cy='21' r='0.6' fill='%23ffffff'/%3E%3C/svg%3E">
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -52,6 +53,8 @@ POPOUT_HTML = """<!DOCTYPE html>
     display: flex;
     flex-direction: column;
   }
+  .spotter-icon { display: inline-block; vertical-align: middle; overflow: visible; }
+  .spotter-brand-icon { width: 22px; height: 22px; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
   .popout-bar {
     background: #161b22;
     padding: 8px 14px;
@@ -117,7 +120,8 @@ POPOUT_HTML = """<!DOCTYPE html>
 <body>
   <div class="popout-bar">
     <div class="popout-title">
-      <span>🐦 British Bird Spotter</span>
+      <span class="spotter-brand-icon"><svg class="spotter-icon bluetit-icon" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="popBtBlue" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#58a6ff"/><stop offset="100%" stop-color="#1f6feb"/></linearGradient><linearGradient id="popBtYellow" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#ffd33d"/><stop offset="100%" stop-color="#d29922"/></linearGradient></defs><circle class="bt-aura" cx="32" cy="32" r="28" stroke="#58a6ff" stroke-width="2"/><path d="M12 52 Q32 50 52 53" stroke="#30363d" stroke-width="3" stroke-linecap="round"/><path d="M28 47 L27 51 M31 47 L31 51 M36 48 L36 52 M39 48 L40 52" stroke="#8b949e" stroke-width="1.8" stroke-linecap="round"/><path d="M16 43 L8 53 L13 55 L21 46 Z" fill="url(#popBtBlue)"/><path d="M28 29 C38 29 45 33 44 44 C43 50 34 51 27 46 C24 42 24 35 28 29 Z" fill="url(#popBtYellow)"/><path d="M27 30 C25 39 19 46 13 44 C12 39 18 30 27 30 Z" fill="url(#popBtBlue)"/><path d="M18 38 L25 35" stroke="#f0f6fc" stroke-width="2" stroke-linecap="round"/><path d="M25 19 C35 21 41 20 44 17 C47 22 45 28 39 31 C32 31 25 27 25 19 Z" fill="#f0f6fc"/><path d="M28 21 Q37 23 44 20 L43 23 Q36 24 28 22 Z" fill="#161b22"/><path d="M37 29 C35 32 31 32 29 30 Z" fill="#161b22"/><path d="M25 17 C31 11 39 12 44 17 C40 20 33 20 25 17 Z" fill="url(#popBtBlue)"/><polygon points="44,19 52,22 44,25" fill="#30363d"/><circle cx="36" cy="21.5" r="1.8" fill="#161b22"/><circle cx="36.5" cy="21" r="0.6" fill="#ffffff"/></svg></span>
+      <span>British Bird Spotter</span>
       <span id="popoutBadge" style="background:#238636; color:#fff; font-size:0.7rem; font-weight:700; padding:2px 6px; border-radius:4px;">LIVE</span>
     </div>
     <div class="popout-actions">
@@ -173,6 +177,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>British Bird Spotter — Live Dashboard</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' fill='none'%3E%3Cdefs%3E%3ClinearGradient id='btBlue' x1='0%25' y1='0%25' x2='100%25' y2='100%25'%3E%3Cstop offset='0%25' stop-color='%2358a6ff'/%3E%3Cstop offset='100%25' stop-color='%231f6feb'/%3E%3C/linearGradient%3E%3ClinearGradient id='btYellow' x1='0%25' y1='0%25' x2='100%25' y2='100%25'%3E%3Cstop offset='0%25' stop-color='%23ffd33d'/%3E%3Cstop offset='100%25' stop-color='%23d29922'/%3E%3C/linearGradient%3E%3C/defs%3E%3Ccircle cx='32' cy='32' r='28' stroke='%2358a6ff' stroke-width='2'/%3E%3Cpath d='M12 52 Q32 50 52 53' stroke='%2330363d' stroke-width='3' stroke-linecap='round'/%3E%3Cpath d='M28 47 L27 51 M31 47 L31 51 M36 48 L36 52 M39 48 L40 52' stroke='%238b949e' stroke-width='1.8' stroke-linecap='round'/%3E%3Cpath d='M16 43 L8 53 L13 55 L21 46 Z' fill='url(%23btBlue)'/%3E%3Cpath d='M28 29 C38 29 45 33 44 44 C43 50 34 51 27 46 C24 42 24 35 28 29 Z' fill='url(%23btYellow)'/%3E%3Cpath d='M27 30 C25 39 19 46 13 44 C12 39 18 30 27 30 Z' fill='url(%23btBlue)'/%3E%3Cpath d='M18 38 L25 35' stroke='%23f0f6fc' stroke-width='2' stroke-linecap='round'/%3E%3Cpath d='M25 19 C35 21 41 20 44 17 C47 22 45 28 39 31 C32 31 25 27 25 19 Z' fill='%23f0f6fc'/%3E%3Cpath d='M28 21 Q37 23 44 20 L43 23 Q36 24 28 22 Z' fill='%23161b22'/%3E%3Cpath d='M37 29 C35 32 31 32 29 30 Z' fill='%23161b22'/%3E%3Cpath d='M25 17 C31 11 39 12 44 17 C40 20 33 20 25 17 Z' fill='url(%23btBlue)'/%3E%3Cpolygon points='44,19 52,22 44,25' fill='%2330363d'/%3Ccircle cx='36' cy='21.5' r='1.8' fill='%23161b22'/%3Ccircle cx='36.5' cy='21' r='0.6' fill='%23ffffff'/%3E%3C/svg%3E">
 <style>
   :root {
     --bg: #0d1117;
@@ -811,17 +816,80 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .log-lvl-ERROR { color: #f85149; background: rgba(248, 81, 73, 0.15); }
   .log-cat { color: #d2a8ff; font-weight: 600; flex-shrink: 0; min-width: 75px; }
   .log-msg { color: var(--text); }
+
+  /* Style 3: Blue Tit Vector Icon & Reactive Badge */
+  .spotter-icon {
+    display: inline-block;
+    vertical-align: middle;
+    overflow: visible;
+  }
+  .spotter-brand-icon {
+    width: 28px;
+    height: 28px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+  .badge-icon-slot {
+    width: 17px;
+    height: 17px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+  .spotter-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    transition: all 0.25s ease;
+  }
+  .bluetit-icon .bt-aura {
+    opacity: 0;
+    transform-origin: 32px 32px;
+    transition: opacity 0.3s ease;
+  }
+  .badge-detected {
+    background: rgba(46, 160, 67, 0.25) !important;
+    border-color: var(--green-bright) !important;
+    color: var(--green-bright) !important;
+    box-shadow: 0 0 10px rgba(63, 185, 80, 0.35);
+  }
+  .badge-detected .bluetit-icon .bt-aura {
+    opacity: 0.8;
+    animation: btAuraPulse 1.8s ease-in-out infinite;
+  }
+  .badge-detected .bluetit-icon {
+    animation: btCuteHop 2s ease-in-out infinite;
+    transform-origin: 32px 50px;
+  }
+  @keyframes btAuraPulse {
+    0%, 100% { opacity: 0.15; transform: scale(0.95); }
+    50% { opacity: 0.65; transform: scale(1.08); }
+  }
+  @keyframes btCuteHop {
+    0%, 80%, 100% { transform: translateY(0); }
+    88% { transform: translateY(-3px) rotate(-1deg); }
+    94% { transform: translateY(0) rotate(1deg); }
+  }
 </style>
 </head>
 <body>
 <header>
-  <h1>🐦 British Bird Spotter</h1>
+  <h1>
+    <span class="spotter-brand-icon"><svg class="spotter-icon bluetit-icon" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="btBlue" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#58a6ff"/><stop offset="100%" stop-color="#1f6feb"/></linearGradient><linearGradient id="btYellow" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#ffd33d"/><stop offset="100%" stop-color="#d29922"/></linearGradient></defs><circle class="bt-aura" cx="32" cy="32" r="28" stroke="#58a6ff" stroke-width="2"/><path d="M12 52 Q32 50 52 53" stroke="#30363d" stroke-width="3" stroke-linecap="round"/><path d="M28 47 L27 51 M31 47 L31 51 M36 48 L36 52 M39 48 L40 52" stroke="#8b949e" stroke-width="1.8" stroke-linecap="round"/><path d="M16 43 L8 53 L13 55 L21 46 Z" fill="url(#btBlue)"/><path d="M28 29 C38 29 45 33 44 44 C43 50 34 51 27 46 C24 42 24 35 28 29 Z" fill="url(#btYellow)"/><path d="M27 30 C25 39 19 46 13 44 C12 39 18 30 27 30 Z" fill="url(#btBlue)"/><path d="M18 38 L25 35" stroke="#f0f6fc" stroke-width="2" stroke-linecap="round"/><path d="M25 19 C35 21 41 20 44 17 C47 22 45 28 39 31 C32 31 25 27 25 19 Z" fill="#f0f6fc"/><path d="M28 21 Q37 23 44 20 L43 23 Q36 24 28 22 Z" fill="#161b22"/><path d="M37 29 C35 32 31 32 29 30 Z" fill="#161b22"/><path d="M25 17 C31 11 39 12 44 17 C40 20 33 20 25 17 Z" fill="url(#btBlue)"/><polygon points="44,19 52,22 44,25" fill="#30363d"/><circle cx="36" cy="21.5" r="1.8" fill="#161b22"/><circle cx="36.5" cy="21" r="0.6" fill="#ffffff"/></svg></span>
+    <span>British Bird Spotter</span>
+  </h1>
   <div class="header-actions">
     <button id="btnToggleLogs" class="badge badge-active" style="cursor:pointer;" onclick="toggleLogsPane()" title="Toggle Live Logging Pane">
       📜 Live Logs
     </button>
     <div id="fsmBadge" class="badge badge-active">WATCHING (HOME 1.0x)</div>
-    <div id="targetBadge" class="badge badge-idle">TARGET: NONE</div>
+    <div id="targetBadge" class="badge badge-idle spotter-badge" title="Live Bird Detection Target">
+      <span class="badge-icon-slot"><svg class="spotter-icon bluetit-icon" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg"><circle class="bt-aura" cx="32" cy="32" r="28" stroke="#58a6ff" stroke-width="2"/><path d="M12 52 Q32 50 52 53" stroke="#30363d" stroke-width="3" stroke-linecap="round"/><path d="M28 47 L27 51 M31 47 L31 51 M36 48 L36 52 M39 48 L40 52" stroke="#8b949e" stroke-width="1.8" stroke-linecap="round"/><path d="M16 43 L8 53 L13 55 L21 46 Z" fill="url(#btBlue)"/><path d="M28 29 C38 29 45 33 44 44 C43 50 34 51 27 46 C24 42 24 35 28 29 Z" fill="url(#btYellow)"/><path d="M27 30 C25 39 19 46 13 44 C12 39 18 30 27 30 Z" fill="url(#btBlue)"/><path d="M18 38 L25 35" stroke="#f0f6fc" stroke-width="2" stroke-linecap="round"/><path d="M25 19 C35 21 41 20 44 17 C47 22 45 28 39 31 C32 31 25 27 25 19 Z" fill="#f0f6fc"/><path d="M28 21 Q37 23 44 20 L43 23 Q36 24 28 22 Z" fill="#161b22"/><path d="M37 29 C35 32 31 32 29 30 Z" fill="#161b22"/><path d="M25 17 C31 11 39 12 44 17 C40 20 33 20 25 17 Z" fill="url(#btBlue)"/><polygon points="44,19 52,22 44,25" fill="#30363d"/><circle cx="36" cy="21.5" r="1.8" fill="#161b22"/><circle cx="36.5" cy="21" r="0.6" fill="#ffffff"/></svg></span>
+      <span id="targetBadgeText">TARGET: NONE</span>
+    </div>
     <button id="btnSolar" class="badge badge-active" style="cursor:pointer;" onclick="sendCtrl({action:'toggle_solar_schedule'})" title="Automatic Sunset/Dawn Scheduler">
       🌅 Auto-Sleep: ON
     </button>
@@ -1936,6 +2004,25 @@ function updateUI(st) {
     fsmBadge.className = 'badge ' + (st.fsm_state === 'MANUAL_OVERRIDE' ? 'badge-warn' : 'badge-active');
   }
 
+  const targetBadge = document.getElementById('targetBadge');
+  const targetBadgeText = document.getElementById('targetBadgeText');
+  const birdCount = st.detections_count || 0;
+  const target = st.primary_target && st.primary_target !== 'None' ? st.primary_target : null;
+
+  if (targetBadge) {
+    if (isNight) {
+      targetBadge.className = 'badge badge-idle spotter-badge';
+      if (targetBadgeText) targetBadgeText.textContent = 'CAMERA OFFLINE';
+    } else if (target || birdCount > 0) {
+      targetBadge.className = 'badge badge-active spotter-badge badge-detected';
+      const label = target ? `TARGET: ${target.toUpperCase()}` : `BIRDS IN VIEW: ${birdCount}`;
+      if (targetBadgeText) targetBadgeText.textContent = label;
+    } else {
+      targetBadge.className = 'badge badge-idle spotter-badge';
+      if (targetBadgeText) targetBadgeText.textContent = 'TARGET: NONE';
+    }
+  }
+
   const pwrBtn = document.getElementById('pwrBtn');
   if (isNight) {
     pwrBtn.textContent = '🌙 NIGHT MODE';
@@ -2102,15 +2189,18 @@ fetch('/api/catalog')
     const relabelSel = document.getElementById('relabelSelect');
     const batchSel = document.getElementById('batchSpeciesSelect');
     if (relabelSel) {
-      relabelSel.innerHTML = list.map(item =>
-        `<option value="${item.common_name}">${item.common_name} (${item.scientific_name})</option>`
-      ).join('');
+      relabelSel.innerHTML = list.map(item => {
+        const cName = item.common_name || item.species || item.name || '';
+        const sName = item.scientific_name ? ` (${item.scientific_name})` : '';
+        return `<option value="${escapeHtml(cName)}">${escapeHtml(cName)}${escapeHtml(sName)}</option>`;
+      }).join('');
     }
     if (batchSel) {
       batchSel.innerHTML = '<option value="">-- Choose New Species --</option>' +
-        list.map(item =>
-          `<option value="${item.common_name}">${item.common_name}</option>`
-        ).join('');
+        list.map(item => {
+          const cName = item.common_name || item.species || item.name || '';
+          return `<option value="${escapeHtml(cName)}">${escapeHtml(cName)}</option>`;
+        }).join('');
     }
   })
   .catch(() => {});
