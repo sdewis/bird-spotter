@@ -19,6 +19,10 @@ def compute_quality_score(confidence: float, sharpness: float) -> float:
     return round(c * math.log10(10.0 + s), 4)
 
 
+NON_DEX_SPECIES: frozenset[str] = frozenset({"Unidentified Bird", "Manual Snapshot", ""})
+
+
+
 class BirdDatabase:
     """Thread-safe SQLite database for bird sightings, species Life List, and photo management."""
 
@@ -97,14 +101,28 @@ class BirdDatabase:
         """
         now_val = now_epoch if now_epoch is not None else time.time()
         with self._lock, self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT best_snapshot_filename, best_quality_score, last_snapshot_ts
-                FROM species_dex
-                WHERE species = ?
-                """,
-                (species,),
-            ).fetchone()
+            if species in NON_DEX_SPECIES:
+                row = conn.execute(
+                    """
+                    SELECT snapshot_filename AS best_snapshot_filename,
+                           MAX(quality_score) AS best_quality_score,
+                           MAX(epoch_ts) AS last_snapshot_ts
+                    FROM sightings
+                    WHERE species = ? AND snapshot_filename IS NOT NULL AND snapshot_filename != ''
+                    """,
+                    (species,),
+                ).fetchone()
+                effective_cooldown = min(per_species_cooldown_sec, 30.0)
+            else:
+                row = conn.execute(
+                    """
+                    SELECT best_snapshot_filename, best_quality_score, last_snapshot_ts
+                    FROM species_dex
+                    WHERE species = ?
+                    """,
+                    (species,),
+                ).fetchone()
+                effective_cooldown = per_species_cooldown_sec
 
             if row is None or not row["best_snapshot_filename"]:
                 return True, "new_species"
@@ -115,7 +133,7 @@ class BirdDatabase:
             if quality_score > best_q * 1.02:
                 return True, "better_quality"
 
-            if (now_val - last_ts) >= per_species_cooldown_sec:
+            if (now_val - last_ts) >= effective_cooldown:
                 return True, "cooldown_elapsed"
 
             return False, "cooldown_active"
@@ -182,81 +200,82 @@ class BirdDatabase:
             )
             sighting_id = int(cur.lastrowid)
 
-            dex_row = conn.execute(
-                "SELECT * FROM species_dex WHERE species = ?", (species,)
-            ).fetchone()
+            if species not in NON_DEX_SPECIES:
+                dex_row = conn.execute(
+                    "SELECT * FROM species_dex WHERE species = ?", (species,)
+                ).fetchone()
 
-            if dex_row is None:
-                conn.execute(
-                    """
-                    INSERT INTO species_dex (
-                        species, scientific_name, first_seen, last_seen, total_sightings,
-                        best_sighting_id, best_snapshot_filename, best_thumb_filename,
-                        best_confidence, best_sharpness, best_quality_score, last_snapshot_ts
-                    ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        species,
-                        scientific_name,
-                        ts_iso,
-                        ts_iso,
-                        sighting_id if snapshot_filename else None,
-                        snapshot_filename,
-                        thumb_filename,
-                        round(float(eff_conf), 4),
-                        round(float(sharpness), 2),
-                        round(q_score, 4) if snapshot_filename else 0.0,
-                        epoch_ts if snapshot_filename else 0.0,
-                    ),
-                )
-            else:
-                new_total = int(dex_row["total_sightings"]) + 1
-                sci_name = scientific_name or dex_row["scientific_name"]
-                best_id = dex_row["best_sighting_id"]
-                best_snap = dex_row["best_snapshot_filename"]
-                best_thumb = dex_row["best_thumb_filename"]
-                best_conf = max(float(dex_row["best_confidence"] or 0.0), float(eff_conf))
-                best_sharp = max(float(dex_row["best_sharpness"] or 0.0), float(sharpness))
-                best_q = float(dex_row["best_quality_score"] or 0.0)
-                last_snap_ts = float(dex_row["last_snapshot_ts"] or 0.0)
+                if dex_row is None:
+                    conn.execute(
+                        """
+                        INSERT INTO species_dex (
+                            species, scientific_name, first_seen, last_seen, total_sightings,
+                            best_sighting_id, best_snapshot_filename, best_thumb_filename,
+                            best_confidence, best_sharpness, best_quality_score, last_snapshot_ts
+                        ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            species,
+                            scientific_name,
+                            ts_iso,
+                            ts_iso,
+                            sighting_id if snapshot_filename else None,
+                            snapshot_filename,
+                            thumb_filename,
+                            round(float(eff_conf), 4),
+                            round(float(sharpness), 2),
+                            round(q_score, 4) if snapshot_filename else 0.0,
+                            epoch_ts if snapshot_filename else 0.0,
+                        ),
+                    )
+                else:
+                    new_total = int(dex_row["total_sightings"]) + 1
+                    sci_name = scientific_name or dex_row["scientific_name"]
+                    best_id = dex_row["best_sighting_id"]
+                    best_snap = dex_row["best_snapshot_filename"]
+                    best_thumb = dex_row["best_thumb_filename"]
+                    best_conf = max(float(dex_row["best_confidence"] or 0.0), float(eff_conf))
+                    best_sharp = max(float(dex_row["best_sharpness"] or 0.0), float(sharpness))
+                    best_q = float(dex_row["best_quality_score"] or 0.0)
+                    last_snap_ts = float(dex_row["last_snapshot_ts"] or 0.0)
 
-                if snapshot_filename:
-                    last_snap_ts = epoch_ts
-                    if not best_snap or q_score >= best_q:
-                        best_id = sighting_id
-                        best_snap = snapshot_filename
-                        best_thumb = thumb_filename
-                        best_q = q_score
+                    if snapshot_filename:
+                        last_snap_ts = epoch_ts
+                        if not best_snap or q_score >= best_q:
+                            best_id = sighting_id
+                            best_snap = snapshot_filename
+                            best_thumb = thumb_filename
+                            best_q = q_score
 
-                conn.execute(
-                    """
-                    UPDATE species_dex
-                    SET scientific_name = ?,
-                        last_seen = ?,
-                        total_sightings = ?,
-                        best_sighting_id = ?,
-                        best_snapshot_filename = ?,
-                        best_thumb_filename = ?,
-                        best_confidence = ?,
-                        best_sharpness = ?,
-                        best_quality_score = ?,
-                        last_snapshot_ts = ?
-                    WHERE species = ?
-                    """,
-                    (
-                        sci_name,
-                        ts_iso,
-                        new_total,
-                        best_id,
-                        best_snap,
-                        best_thumb,
-                        round(best_conf, 4),
-                        round(best_sharp, 2),
-                        round(best_q, 4),
-                        last_snap_ts,
-                        species,
-                    ),
-                )
+                    conn.execute(
+                        """
+                        UPDATE species_dex
+                        SET scientific_name = ?,
+                            last_seen = ?,
+                            total_sightings = ?,
+                            best_sighting_id = ?,
+                            best_snapshot_filename = ?,
+                            best_thumb_filename = ?,
+                            best_confidence = ?,
+                            best_sharpness = ?,
+                            best_quality_score = ?,
+                            last_snapshot_ts = ?
+                        WHERE species = ?
+                        """,
+                        (
+                            sci_name,
+                            ts_iso,
+                            new_total,
+                            best_id,
+                            best_snap,
+                            best_thumb,
+                            round(best_conf, 4),
+                            round(best_sharp, 2),
+                            round(best_q, 4),
+                            last_snap_ts,
+                            species,
+                        ),
+                    )
 
             return {
                 "id": sighting_id,
@@ -285,6 +304,8 @@ class BirdDatabase:
             dex_map: dict[str, dict[str, Any]] = {}
             for r in rows:
                 sp = r["species"]
+                if sp in NON_DEX_SPECIES:
+                    continue
                 eff_conf = (
                     float(r["species_confidence"])
                     if float(r["species_confidence"]) > 0
@@ -371,6 +392,65 @@ class BirdDatabase:
                 self.rebuild_species_dex()
             return changed
 
+    def batch_relabel_sightings(
+        self, sighting_ids: list[int], new_species: str, scientific_name: str = ""
+    ) -> int:
+        """Manually re-label multiple sightings to a different species and rebuild species_dex."""
+        if not sighting_ids:
+            return 0
+        with self._lock:
+            with self._connect() as conn:
+                placeholders = ",".join("?" for _ in sighting_ids)
+                params: list[Any] = [new_species, scientific_name, scientific_name] + [int(x) for x in sighting_ids]
+                cur = conn.execute(
+                    f"""
+                    UPDATE sightings
+                    SET species = ?,
+                        scientific_name = CASE WHEN ? != '' THEN ? ELSE scientific_name END,
+                        verified_status = 'relabeled'
+                    WHERE id IN ({placeholders})
+                    """,
+                    params,
+                )
+                changed = cur.rowcount
+            if changed > 0:
+                self.rebuild_species_dex()
+            return changed
+
+    def delete_species(
+        self, species: str, snapshots_dir: Path | None = None
+    ) -> int:
+        """Delete all sightings of a species, remove associated photo files, and rebuild species_dex."""
+        with self._lock:
+            files_to_remove: set[str] = set()
+            deleted_count = 0
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT snapshot_filename, thumb_filename FROM sightings WHERE species = ?",
+                    (species,),
+                ).fetchall()
+                for r in rows:
+                    if r["snapshot_filename"]:
+                        files_to_remove.add(r["snapshot_filename"])
+                    if r["thumb_filename"]:
+                        files_to_remove.add(r["thumb_filename"])
+
+                cur = conn.execute("DELETE FROM sightings WHERE species = ?", (species,))
+                deleted_count = cur.rowcount
+                conn.execute("DELETE FROM species_dex WHERE species = ?", (species,))
+
+            if snapshots_dir is not None:
+                for fname in files_to_remove:
+                    fpath = (snapshots_dir / fname).resolve()
+                    if fpath.is_file() and snapshots_dir.resolve() in fpath.parents:
+                        try:
+                            fpath.unlink()
+                        except OSError:
+                            pass
+
+            self.rebuild_species_dex()
+            return deleted_count
+
     def delete_sighting(
         self, sighting_id: int, snapshots_dir: Path | None = None
     ) -> bool:
@@ -418,6 +498,12 @@ class BirdDatabase:
                 """
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def get_total_sightings_count(self) -> int:
+        """Return total number of recorded sightings (including unidentified birds)."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS cnt FROM sightings").fetchone()
+            return int(row["cnt"]) if row else 0
 
     def get_species_stats_dict(self) -> dict[str, dict[str, Any]]:
         """Return legacy-compatible dictionary keyed by species name."""

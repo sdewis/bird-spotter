@@ -1,4 +1,17 @@
-"""Live MJPEG streaming and responsive desktop/mobile dashboard for British Bird Spotter."""
+"""Web Dashboard and MJPEG Streaming Server for Bird Spotter.
+
+Provides a responsive web interface at http://<pi-ip>:8080 with:
+- Live MJPEG video feed with Hailo-8 bounding box overlays, Zone of Interest (ROI), and HUD telemetry
+- Camera preview pop-out and full-screen controls
+- Night mode handling with "Night mode \nCamera Offline" display over black background and greyed-out camera controls
+- Bird Dex life-list with per-species deletion trash cans
+- Recent captures gallery with multi-card selection and batch classification override
+- Deep-zoom capture modal supporting magnifying glass cursor, click zoom, scroll wheel zoom, and mobile pinch
+- PTZ gimbal jog D-pad, FOV, motorized focus, optical/digital zoom slider, and Home preset save
+- Zone of Interest interactive click-and-drag selector on the video canvas
+- Hourly and 14-day sighting analytics charts
+- Collapsible real-time execution log console
+"""
 
 from __future__ import annotations
 
@@ -9,194 +22,280 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import threading
+import time
 from typing import Any, Callable
 from urllib.parse import parse_qs, unquote, urlparse
 
 import cv2
 import numpy as np
 
+from bird_spotter.logger import spotter_log
 from bird_spotter.vision.detector import Detection
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-SNAPSHOTS_DIR = PROJECT_ROOT / "snapshots"
+SNAPSHOTS_DIR = PROJECT_ROOT / "data" / "snapshots"
+
+POPOUT_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bird Spotter — Live Pop-out Feed</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #000000;
+    color: #f0f6fc;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    overflow: hidden;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  .popout-bar {
+    background: #161b22;
+    padding: 8px 14px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid #30363d;
+    z-index: 10;
+  }
+  .popout-title {
+    font-size: 0.88rem;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .popout-actions {
+    display: flex;
+    gap: 8px;
+  }
+  button {
+    background: #21262d;
+    color: #c9d1d9;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-size: 0.78rem;
+    cursor: pointer;
+  }
+  button:hover { background: #30363d; color: #fff; }
+  .video-stage {
+    flex: 1;
+    position: relative;
+    background: #000000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+  }
+  img {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+    display: block;
+  }
+  .night-msg {
+    display: none;
+    position: absolute;
+    inset: 0;
+    background: #000000;
+    color: #f0f6fc;
+    font-size: 1.6rem;
+    font-weight: 600;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    white-space: pre-line;
+    line-height: 1.4;
+    z-index: 20;
+  }
+</style>
+</head>
+<body>
+  <div class="popout-bar">
+    <div class="popout-title">
+      <span>🐦 British Bird Spotter</span>
+      <span id="popoutBadge" style="background:#238636; color:#fff; font-size:0.7rem; font-weight:700; padding:2px 6px; border-radius:4px;">LIVE</span>
+    </div>
+    <div class="popout-actions">
+      <button onclick="toggleCleanStream()" id="btnClean">Clean: OFF</button>
+      <button onclick="toggleFullscreen()">⛶ Fullscreen</button>
+      <button onclick="window.close()">✕ Close</button>
+    </div>
+  </div>
+  <div class="video-stage" id="stage">
+    <img id="popoutImg" src="/stream.mjpg" alt="Live Feed">
+    <div id="popoutNight" class="night-msg">Night mode &#10;Camera Offline</div>
+  </div>
+<script>
+  let clean = false;
+  function toggleCleanStream() {
+    clean = !clean;
+    document.getElementById('btnClean').textContent = 'Clean: ' + (clean ? 'ON' : 'OFF');
+    document.getElementById('popoutImg').src = clean ? '/stream.mjpg?clean=1' : '/stream.mjpg';
+  }
+  function toggleFullscreen() {
+    if (!document.fullscreenElement) {
+      document.documentElement.requestFullscreen().catch(()=>{});
+    } else {
+      document.exitFullscreen().catch(()=>{});
+    }
+  }
+  setInterval(async () => {
+    try {
+      const res = await fetch('/api/state');
+      if (res.ok) {
+        const st = await res.json();
+        const nightEl = document.getElementById('popoutNight');
+        const imgEl = document.getElementById('popoutImg');
+        const isNight = !!st.is_night_mode;
+        if (isNight) {
+          nightEl.style.display = 'flex';
+          imgEl.style.display = 'none';
+        } else {
+          nightEl.style.display = 'none';
+          imgEl.style.display = 'block';
+        }
+      }
+    } catch(e){}
+  }, 900);
+</script>
+</body>
+</html>
+"""
 
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>Bird Spotter — British Bird Watch & PTZ Tracker</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>British Bird Spotter — Live Dashboard</title>
 <style>
   :root {
     --bg: #0d1117;
-    --panel: #161b22;
-    --panel-header: #21262d;
+    --card: #161b22;
     --border: #30363d;
-    --text: #f0f6fc;
+    --text: #c9d1d9;
+    --text-bright: #f0f6fc;
     --muted: #8b949e;
-    --green: #2ea043;
     --green-bright: #3fb950;
-    --cyan: #388bfd;
-    --orange: #d29922;
-    --red: #f85149;
+    --accent: #238636;
+    --accent-hover: #2ea043;
+    --danger: #da3633;
+    --warn: #d29922;
+    --cyan: #58a6ff;
   }
-  * { box-sizing: border-box; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
-    margin: 0;
     background: var(--bg);
     color: var(--text);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    -webkit-tap-highlight-color: transparent;
+    line-height: 1.45;
+    padding-bottom: 24px;
   }
   header {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-    padding: 12px 20px;
-    background: var(--panel);
+    background: var(--card);
     border-bottom: 1px solid var(--border);
+    padding: 10px 18px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
     position: sticky;
     top: 0;
     z-index: 50;
   }
   header h1 {
-    margin: 0;
-    font-size: 1.2rem;
+    font-size: 1.15rem;
     font-weight: 700;
+    color: var(--text-bright);
     display: flex;
     align-items: center;
     gap: 8px;
-    color: var(--green-bright);
   }
   .header-actions {
     display: flex;
-    flex-wrap: wrap;
+    gap: 10px;
     align-items: center;
-    gap: 8px;
   }
   .badge {
-    padding: 5px 11px;
+    padding: 3px 10px;
     border-radius: 999px;
-    font-size: 0.78rem;
-    font-weight: 600;
-    background: #21262d;
-    border: 1px solid var(--border);
-    white-space: nowrap;
-  }
-  .badge-active {
-    background: rgba(46, 160, 67, 0.2);
-    color: var(--green-bright);
-    border-color: var(--green);
-  }
-  .badge-warn {
-    background: rgba(210, 153, 34, 0.2);
-    color: #e3b341;
-    border-color: var(--orange);
-  }
-  .badge-idle {
-    background: rgba(139, 148, 158, 0.15);
-    color: var(--muted);
-  }
-  .power-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 6px 12px;
-    border-radius: 999px;
+    font-size: 0.74rem;
     font-weight: 700;
-    font-size: 0.8rem;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+  }
+  .badge-active { background: rgba(46, 160, 67, 0.2); color: var(--green-bright); border: 1px solid rgba(46, 160, 67, 0.4); }
+  .badge-idle { background: rgba(139, 148, 158, 0.15); color: var(--muted); border: 1px solid var(--border); }
+  .badge-warn { background: rgba(210, 153, 34, 0.2); color: var(--warn); border: 1px solid rgba(210, 153, 34, 0.4); }
+  .badge-night { background: rgba(88, 166, 255, 0.2); color: var(--cyan); border: 1px solid rgba(88, 166, 255, 0.4); }
+
+  .power-btn {
+    padding: 5px 12px;
+    border-radius: 999px;
+    font-size: 0.76rem;
+    font-weight: 700;
     cursor: pointer;
+    border: 1px solid var(--border);
+    transition: all 0.15s ease;
   }
-  .power-on {
-    background: rgba(46, 160, 67, 0.15);
-    color: #3fb950;
-    border: 2px solid var(--green);
-  }
-  .power-off {
-    background: rgba(248, 81, 73, 0.15);
-    color: #f85149;
-    border: 2px solid var(--red);
-  }
+  .power-on { background: #238636; color: #fff; border-color: #2ea043; }
+  .power-off { background: #21262d; color: var(--muted); }
+
   main {
+    max-width: 1440px;
+    margin: 14px auto 0 auto;
+    padding: 0 16px;
     display: grid;
-    grid-template-columns: 1.15fr 0.85fr;
+    grid-template-columns: 1.45fr 1fr;
     gap: 16px;
-    padding: 16px 20px;
-    max-width: 1720px;
-    margin: 0 auto;
   }
-  @media (max-width: 1024px) {
-    main { grid-template-columns: 1fr; padding: 12px; }
-    header { padding: 10px 12px; }
+  @media (max-width: 1080px) {
+    main { grid-template-columns: 1fr; }
   }
+
   .left-pane, .right-pane {
     display: flex;
     flex-direction: column;
-    gap: 14px;
+    gap: 16px;
   }
+
   .card {
-    background: var(--panel);
+    background: var(--card);
     border: 1px solid var(--border);
-    border-radius: 10px;
+    border-radius: 8px;
     overflow: hidden;
   }
   .card-header {
+    background: #1c2128;
+    padding: 9px 14px;
+    border-bottom: 1px solid var(--border);
     display: flex;
-    flex-wrap: wrap;
     justify-content: space-between;
     align-items: center;
-    gap: 8px;
-    padding: 10px 14px;
-    background: var(--panel-header);
-    border-bottom: 1px solid var(--border);
-    font-size: 0.88rem;
     font-weight: 600;
+    font-size: 0.88rem;
+    color: var(--text-bright);
   }
-  .card-body { padding: 14px; }
+  .card-body {
+    padding: 14px;
+  }
+
+  /* VIDEO PREVIEW AREA */
   .video-container {
+    position: relative;
     width: 100%;
     aspect-ratio: 16 / 9;
-    background: #090d13;
+    background: #000000;
+    overflow: hidden;
     display: flex;
     align-items: center;
     justify-content: center;
-    position: relative;
-    overflow: hidden;
   }
-  #roiEditorOverlay {
-    position: absolute;
-    inset: 0;
-    z-index: 20;
-    display: none;
-    touch-action: none;
-    user-select: none;
-  }
-  #roiSelectionBox {
-    position: absolute;
-    border: 3px dashed #ffee00;
-    outline: 2px solid #000;
-    box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.70);
-    cursor: move;
-    box-sizing: border-box;
-  }
-  .roi-handle {
-    width: 22px;
-    height: 22px;
-    background: #ffee00;
-    border: 2px solid #000;
-    border-radius: 50%;
-    position: absolute;
-    touch-action: none;
-    box-sizing: border-box;
-    box-shadow: 0 0 8px rgba(0, 0, 0, 0.8);
-  }
-  .roi-handle-nw { top: -11px; left: -11px; cursor: nwse-resize; }
-  .roi-handle-ne { top: -11px; right: -11px; cursor: nesw-resize; }
-  .roi-handle-sw { bottom: -11px; left: -11px; cursor: nesw-resize; }
-  .roi-handle-se { bottom: -11px; right: -11px; cursor: nwse-resize; }
-  .video-container img {
+  .video-container img#streamImg {
     width: 100%;
     height: 100%;
     object-fit: contain;
@@ -204,27 +303,155 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
   .video-off {
     display: none;
+    position: absolute;
+    inset: 0;
+    background: #000000;
     color: var(--muted);
-    font-size: 0.95rem;
+    font-size: 1.1rem;
+    font-weight: 600;
+    align-items: center;
+    justify-content: center;
+    z-index: 10;
   }
+
+  /* NIGHT MODE OVERLAY: Requirement 1 */
+  .night-mode-overlay {
+    position: absolute;
+    inset: 0;
+    background: #000000;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    z-index: 25;
+    color: #f0f6fc;
+    text-align: center;
+    padding: 20px;
+  }
+  .night-mode-text {
+    font-size: 1.7rem;
+    font-weight: 700;
+    line-height: 1.45;
+    letter-spacing: 0.02em;
+    white-space: pre-line;
+    color: #f0f6fc;
+  }
+
   .override-banner {
     display: none;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-    padding: 8px 14px;
-    background: rgba(210, 153, 34, 0.18);
-    border-bottom: 1px solid var(--orange);
+    background: #382404;
+    border-bottom: 1px solid #7a4706;
     color: #e3b341;
-    font-size: 0.82rem;
+    padding: 6px 14px;
+    font-size: 0.78rem;
     font-weight: 600;
+    justify-content: space-between;
+    align-items: center;
   }
+
+  /* ROI EDITOR OVERLAY */
+  #roiEditorOverlay {
+    position: absolute;
+    inset: 0;
+    display: none;
+    cursor: crosshair;
+    z-index: 15;
+    user-select: none;
+  }
+  #roiSelectionBox {
+    position: absolute;
+    border: 2px dashed #ffff00;
+    background: rgba(255, 255, 0, 0.12);
+    box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.65);
+    display: none;
+  }
+  .roi-handle {
+    position: absolute;
+    width: 12px;
+    height: 12px;
+    background: #ffff00;
+    border: 1px solid #000;
+    border-radius: 2px;
+  }
+  .roi-handle-nw { top: -6px; left: -6px; cursor: nwse-resize; }
+  .roi-handle-ne { top: -6px; right: -6px; cursor: nesw-resize; }
+  .roi-handle-sw { bottom: -6px; left: -6px; cursor: nesw-resize; }
+  .roi-handle-se { bottom: -6px; right: -6px; cursor: nwse-resize; }
+
+  /* BUTTONS & CONTROLS */
+  button {
+    background: #21262d;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 12px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+    user-select: none;
+  }
+  button:hover {
+    background: #30363d;
+    color: var(--text-bright);
+    border-color: #8b949e;
+  }
+  button.active {
+    background: rgba(56, 139, 253, 0.2);
+    color: #58a6ff;
+    border-color: #388bfd;
+  }
+  .btn-primary {
+    background: var(--accent);
+    color: #fff;
+    border-color: #2ea043;
+  }
+  .btn-primary:hover {
+    background: var(--accent-hover);
+    border-color: #3fb950;
+  }
+  .btn-danger {
+    background: rgba(248, 81, 73, 0.15);
+    color: #f85149;
+    border-color: rgba(248, 81, 73, 0.35);
+  }
+  .btn-danger:hover {
+    background: #da3633;
+    color: #fff;
+    border-color: #f85149;
+  }
+  .btn-subtle {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    padding: 3px 8px;
+    font-size: 0.76rem;
+  }
+  .btn-subtle:hover {
+    background: #21262d;
+    color: var(--text-bright);
+  }
+
+  /* GREYED OUT CAMERA CONTROLS IN NIGHT MODE: Requirement 1 */
+  .controls-disabled {
+    opacity: 0.35 !important;
+    pointer-events: none !important;
+    filter: grayscale(0.9) !important;
+    user-select: none !important;
+  }
+  button:disabled, select:disabled, input:disabled {
+    opacity: 0.35 !important;
+    cursor: not-allowed !important;
+    pointer-events: none !important;
+  }
+
+  /* STATS TELEMETRY */
   .stat-grid {
     display: grid;
     grid-template-columns: repeat(4, 1fr);
     gap: 8px;
   }
-  @media (max-width: 640px) {
+  @media (max-width: 720px) {
     .stat-grid { grid-template-columns: repeat(2, 1fr); }
   }
   .stat-box {
@@ -234,150 +461,173 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     padding: 8px 10px;
   }
   .stat-label {
-    font-size: 0.7rem;
+    font-size: 0.72rem;
     color: var(--muted);
+    font-weight: 600;
     text-transform: uppercase;
-    letter-spacing: 0.4px;
+    letter-spacing: 0.03em;
   }
   .stat-val {
-    font-size: 0.98rem;
-    font-weight: 600;
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: var(--text-bright);
     margin-top: 3px;
-    color: var(--text);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
   }
-  button {
-    background: #21262d;
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 8px 12px;
-    font-size: 0.82rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 0.15s, border-color 0.15s;
-    touch-action: manipulation;
-  }
-  button:hover:not(:disabled) {
-    background: #30363d;
-    border-color: #8b949e;
-  }
-  button.btn-primary {
-    background: var(--green);
-    border-color: var(--green-bright);
-    color: #fff;
-  }
-  button.btn-primary:hover { background: var(--green-bright); }
-  button.btn-danger {
-    background: rgba(248, 81, 73, 0.18);
-    border-color: var(--red);
-    color: #ff7b72;
-  }
-  button.btn-danger:hover { background: rgba(248, 81, 73, 0.32); }
-  button.active {
-    background: rgba(46, 160, 67, 0.25);
-    border-color: var(--green-bright);
-    color: var(--green-bright);
-  }
+
+  /* PTZ DPAD */
   .dpad {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 8px;
-    max-width: 300px;
-    margin: 8px auto;
+    grid-template-columns: repeat(3, 44px);
+    grid-template-rows: repeat(3, 38px);
+    gap: 6px;
+    justify-content: center;
+    margin: 10px auto;
   }
   .dpad button {
-    padding: 12px 10px;
-    font-size: 0.9rem;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.82rem;
   }
+
   .zoom-bar {
     display: flex;
-    flex-wrap: wrap;
-    align-items: center;
     gap: 6px;
     margin-top: 8px;
-    justify-content: center;
   }
+  .zoom-bar button { flex: 1; }
+
+  /* TABS */
   .tabs {
     display: flex;
     border-bottom: 1px solid var(--border);
-    background: #11161d;
+    background: #1c2128;
   }
   .tab-btn {
     flex: 1;
+    border-radius: 0;
     border: none;
     border-bottom: 2px solid transparent;
-    border-radius: 0;
     background: transparent;
-    padding: 10px 8px;
-    font-size: 0.82rem;
+    padding: 9px 12px;
+    font-size: 0.84rem;
     color: var(--muted);
   }
+  .tab-btn:hover { background: #21262d; color: var(--text-bright); }
   .tab-btn.active {
     color: var(--green-bright);
     border-bottom-color: var(--green-bright);
-    background: rgba(46, 160, 67, 0.08);
+    background: #161b22;
   }
-  .tab-panel { display: none; padding: 14px; }
+  .tab-panel {
+    display: none;
+    padding: 12px;
+  }
   .tab-panel.active { display: block; }
+
+  /* BIRD DEX CARDS & TRASH CAN: Requirement 3 */
   .dex-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
     gap: 10px;
+    max-height: 480px;
+    overflow-y: auto;
   }
   .dex-card {
     background: #0d1117;
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: 6px;
     overflow: hidden;
     display: flex;
     flex-direction: column;
+    position: relative;
+    transition: transform 0.15s, border-color 0.15s;
+  }
+  .dex-card:hover {
+    border-color: #58a6ff;
+    transform: translateY(-2px);
   }
   .dex-card img {
     width: 100%;
     aspect-ratio: 4 / 3;
     object-fit: cover;
-    background: #05070a;
+    background: #000;
     cursor: pointer;
   }
   .dex-info {
-    padding: 9px 11px;
+    padding: 8px 10px;
     display: flex;
     flex-direction: column;
-    gap: 3px;
+    gap: 2px;
+    flex: 1;
   }
   .dex-title {
+    font-size: 0.84rem;
+    font-weight: 700;
+    color: var(--text-bright);
     display: flex;
     justify-content: space-between;
     align-items: center;
-    font-weight: 700;
-    font-size: 0.92rem;
+    gap: 4px;
   }
   .dex-sci {
-    font-size: 0.74rem;
+    font-size: 0.72rem;
     color: var(--muted);
     font-style: italic;
   }
   .dex-meta {
-    font-size: 0.72rem;
+    font-size: 0.7rem;
     color: var(--muted);
-    margin-top: 3px;
+    margin-top: 4px;
   }
   .species-count-badge {
     background: rgba(46, 160, 67, 0.2);
-    border: 1px solid var(--green);
-    padding: 1px 8px;
-    border-radius: 999px;
-    font-size: 0.76rem;
-    font-weight: 700;
     color: var(--green-bright);
+    border: 1px solid rgba(46, 160, 67, 0.4);
+    font-size: 0.68rem;
+    padding: 1px 6px;
+    border-radius: 999px;
+    font-weight: 700;
+  }
+  .dex-trash-btn {
+    background: rgba(248, 81, 73, 0.15);
+    border: 1px solid rgba(248, 81, 73, 0.35);
+    color: #f85149;
+    border-radius: 4px;
+    padding: 2px 5px;
+    font-size: 0.76rem;
+    cursor: pointer;
+    line-height: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .dex-trash-btn:hover {
+    background: #da3633;
+    color: #fff;
+    border-color: #f85149;
+  }
+
+  /* CAPTURES GALLERY & BATCH RELABEL TOOLBAR: Requirement 4 */
+  .batch-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    background: #11151c;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 12px;
+    margin-bottom: 10px;
   }
   .snapshot-gallery {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-    gap: 10px;
+    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+    gap: 8px;
+    max-height: 480px;
+    overflow-y: auto;
   }
   .snap-card {
     background: #0d1117;
@@ -385,29 +635,50 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     border-radius: 6px;
     overflow: hidden;
     cursor: pointer;
-    transition: border-color 0.15s;
+    position: relative;
+    transition: transform 0.15s, border-color 0.15s;
   }
-  .snap-card:hover { border-color: var(--green-bright); }
+  .snap-card:hover {
+    border-color: var(--cyan);
+    transform: translateY(-2px);
+  }
+  .snap-card.selected {
+    border-color: #58a6ff;
+    box-shadow: 0 0 0 2px #58a6ff;
+  }
   .snap-card img {
     width: 100%;
-    aspect-ratio: 16 / 10;
+    aspect-ratio: 4 / 3;
     object-fit: cover;
     display: block;
     background: #000;
   }
+  .snap-select-cb {
+    position: absolute;
+    top: 6px;
+    left: 6px;
+    width: 18px;
+    height: 18px;
+    accent-color: #238636;
+    cursor: pointer;
+    z-index: 5;
+  }
   .snap-card-caption {
-    padding: 6px 8px;
-    font-size: 0.75rem;
+    padding: 4px 6px;
+    font-size: 0.72rem;
     display: flex;
     justify-content: space-between;
     align-items: center;
+    background: #161b22;
   }
+
+  /* ANALYTICS CHARTS */
   .chart-bars {
     display: flex;
     align-items: flex-end;
-    gap: 4px;
-    height: 120px;
-    padding-top: 14px;
+    gap: 3px;
+    height: 100px;
+    padding: 8px 0;
     border-bottom: 1px solid var(--border);
   }
   .chart-col {
@@ -420,71 +691,141 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
   .chart-bar {
     width: 100%;
-    background: var(--green);
-    border-radius: 3px 3px 0 0;
+    background: var(--green-bright);
+    border-radius: 2px 2px 0 0;
     min-height: 2px;
-    transition: height 0.2s;
   }
   .chart-lbl {
-    font-size: 0.62rem;
+    font-size: 0.6rem;
     color: var(--muted);
     margin-top: 4px;
+    height: 12px;
   }
-  .status-toast {
-    font-size: 0.8rem;
-    color: var(--green-bright);
-    min-height: 18px;
-    margin-top: 6px;
-    text-align: center;
-  }
-  /* Modal for Snapshot Inspection, Relabeling & Deletion */
+
+  /* DETAILED CAPTURE POPUP MODAL & DEEP ZOOM: Requirement 5 */
   .modal-backdrop {
     display: none;
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.8);
-    z-index: 200;
+    background: rgba(0, 0, 0, 0.85);
+    z-index: 100;
     align-items: center;
     justify-content: center;
     padding: 16px;
   }
   .modal-backdrop.open { display: flex; }
   .modal-box {
-    background: var(--panel);
+    background: var(--card);
     border: 1px solid var(--border);
-    border-radius: 10px;
-    max-width: 780px;
+    border-radius: 8px;
+    max-width: 900px;
     width: 100%;
-    max-height: 92vh;
-    overflow-y: auto;
+    max-height: 94vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
   }
-  .modal-box img {
+  .modal-img-frame {
+    position: relative;
     width: 100%;
-    max-height: 55vh;
+    height: 54vh;
+    min-height: 280px;
+    background: #000000;
+    overflow: hidden; /* strictly within image frame area */
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: zoom-in; /* magnifying glass */
+    user-select: none;
+    touch-action: none;
+  }
+  .modal-img-frame.zoomed-in {
+    cursor: zoom-out; /* magnifying glass when zoomed */
+  }
+  .modal-zoom-img {
+    max-width: 100%;
+    max-height: 100%;
     object-fit: contain;
-    background: #000;
     display: block;
+    transform-origin: center center;
+    transition: transform 0.08s ease-out;
+    pointer-events: auto;
+    cursor: inherit;
   }
-  select, input[type="range"] {
-    background: #0d1117;
-    color: var(--text);
+  .zoom-indicator-pill {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    background: rgba(13, 17, 23, 0.8);
+    color: #58a6ff;
+    font-size: 0.74rem;
+    font-weight: 700;
+    padding: 3px 8px;
+    border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    pointer-events: none;
+    z-index: 10;
+  }
+
+  .status-toast {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    background: #161b22;
+    border: 1px solid var(--green-bright);
+    color: var(--text-bright);
+    padding: 8px 16px;
+    border-radius: 6px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+    font-size: 0.82rem;
+    display: none;
+    z-index: 200;
+  }
+
+  /* LIVE LOGGING PANE */
+  .log-terminal {
+    background: #080b0f;
     border: 1px solid var(--border);
     border-radius: 6px;
-    padding: 7px 10px;
-    font-size: 0.84rem;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    font-size: 0.74rem;
+    height: 220px;
+    overflow-y: auto;
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    line-height: 1.4;
   }
+  .log-line {
+    display: flex;
+    gap: 8px;
+    word-break: break-all;
+    white-space: pre-wrap;
+  }
+  .log-ts { color: var(--muted); flex-shrink: 0; }
+  .log-lvl { font-weight: 700; flex-shrink: 0; width: 44px; text-align: center; border-radius: 3px; padding: 0 2px; }
+  .log-lvl-INFO { color: var(--green-bright); background: rgba(46, 160, 67, 0.15); }
+  .log-lvl-DEBUG { color: #58a6ff; background: rgba(56, 139, 253, 0.15); }
+  .log-lvl-WARN { color: #e3b341; background: rgba(210, 153, 34, 0.15); }
+  .log-lvl-ERROR { color: #f85149; background: rgba(248, 81, 73, 0.15); }
+  .log-cat { color: #d2a8ff; font-weight: 600; flex-shrink: 0; min-width: 75px; }
+  .log-msg { color: var(--text); }
 </style>
 </head>
 <body>
 <header>
   <h1>🐦 British Bird Spotter</h1>
   <div class="header-actions">
+    <button id="btnToggleLogs" class="badge badge-active" style="cursor:pointer;" onclick="toggleLogsPane()" title="Toggle Live Logging Pane">
+      📜 Live Logs
+    </button>
     <div id="fsmBadge" class="badge badge-active">WATCHING (HOME 1.0x)</div>
     <div id="targetBadge" class="badge badge-idle">TARGET: NONE</div>
     <button id="btnSolar" class="badge badge-active" style="cursor:pointer;" onclick="sendCtrl({action:'toggle_solar_schedule'})" title="Automatic Sunset/Dawn Scheduler">
       🌅 Auto-Sleep: ON
     </button>
-    <button id="pwrBtn" class="power-btn power-on" onclick="sendCtrl({action:'toggle_system_power'})">
+    <button id="pwrBtn" class="power-btn power-on" onclick="togglePowerOrDayNight()">
       ⏻ CAM ACTIVE
     </button>
     <button class="btn-danger" style="padding:5px 10px; font-size:0.76rem; border-radius:999px;" onclick="if(confirm('Safely shut down Raspberry Pi so you can unplug power?')) { showToast('Shutting down Raspberry Pi...'); sendCtrl({action:'shutdown_pi'}); }">
@@ -499,16 +840,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="card">
       <div class="card-header">
         <span>📹 Live OBSBOT Tiny SE Feed</span>
-        <div style="display:flex; flex-wrap:wrap; gap:6px;">
-          <button class="btn-primary" onclick="takeSnapshot()">📸 Manual Snapshot</button>
-          <button id="btnEditRoi" onclick="toggleRoiEditor()" title="Configure Zone of Interest on feeder">🎯 Select Zone</button>
-          <label id="lblLockAspect" style="display:none; align-items:center; gap:5px; font-size:0.75rem; color:var(--text); cursor:pointer; background:#21262d; padding:4px 8px; border-radius:6px; border:1px solid var(--border);"><input type="checkbox" id="chkLockAspect"> 🔒 16:9</label>
-          <button id="btnApplyRoi" class="btn-primary" style="display:none;" onclick="applyRoiSelection()" title="Save Zone of Interest">✅ Set Zone</button>
-          <button id="btnClearRoi" class="btn-danger" style="display:none;" onclick="clearRoiSelection()" title="Disable Zone of Interest">❌ Unset Zone</button>
-          <button id="btnPreviewBbox" class="active" onclick="sendCtrl({action:'toggle_preview_bbox'})" title="Toggle bounding boxes on live camera preview">📦 Preview Box: ON</button>
-          <button id="btnCaptureBbox" class="active" onclick="sendCtrl({action:'toggle_capture_bbox'})" title="Toggle bounding boxes on saved bird snapshots">🖼️ Capture Box: ON</button>
-          <button id="btnHudMode" class="active" onclick="toggleStreamHud()">HUD: ON</button>
-          <button id="btnToggleCam" class="active" onclick="toggleCamPreview()">Stream: ON</button>
+        <div style="display:flex; flex-wrap:wrap; gap:6px; align-items:center;">
+          <!-- Requirement 2: Pop-out and Full Screen buttons -->
+          <button id="btnPopout" class="cam-ctrl" onclick="openPopout()" title="Pop out camera stream in a separate window">↗ Pop-out</button>
+          <button id="btnFullscreen" class="cam-ctrl" onclick="toggleFullscreen()" title="Toggle full screen preview">⛶ Fullscreen</button>
+          <button id="btnManualSnap" class="btn-primary cam-ctrl" onclick="takeSnapshot()">📸 Manual Snapshot</button>
+          <button id="btnEditRoi" class="cam-ctrl" onclick="toggleRoiEditor()" title="Configure Zone of Interest on feeder">🎯 Select Zone</button>
+          <label id="lblLockAspect" class="cam-ctrl" style="display:none; align-items:center; gap:5px; font-size:0.75rem; color:var(--text); cursor:pointer; background:#21262d; padding:4px 8px; border-radius:6px; border:1px solid var(--border);"><input type="checkbox" id="chkLockAspect"> 🔒 16:9</label>
+          <button id="btnApplyRoi" class="btn-primary cam-ctrl" style="display:none;" onclick="applyRoiSelection()" title="Save Zone of Interest">✅ Set Zone</button>
+          <button id="btnClearRoi" class="btn-danger cam-ctrl" style="display:none;" onclick="clearRoiSelection()" title="Disable Zone of Interest">❌ Unset Zone</button>
+          <button id="btnPreviewBbox" class="active cam-ctrl" onclick="sendCtrl({action:'toggle_preview_bbox'})" title="Toggle bounding boxes on live camera preview">📦 Preview Box: ON</button>
+          <button id="btnCaptureBbox" class="active cam-ctrl" onclick="sendCtrl({action:'toggle_capture_bbox'})" title="Toggle bounding boxes on saved bird snapshots">🖼️ Capture Box: ON</button>
+          <button id="btnHudMode" class="active cam-ctrl" onclick="toggleStreamHud()">HUD: ON</button>
+          <button id="btnToggleCam" class="active cam-ctrl" onclick="toggleCamPreview()">Stream: ON</button>
         </div>
       </div>
       <div id="overrideBanner" class="override-banner">
@@ -517,9 +861,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           ▶ Resume Auto-Framing Now
         </button>
       </div>
-      <div class="video-container">
+      <div class="video-container" id="videoContainer">
         <img id="streamImg" src="/stream.mjpg" alt="Bird Spotter Live Stream">
         <div id="streamOffText" class="video-off">Camera stream paused</div>
+
+        <!-- Requirement 1: Night mode message over black background -->
+        <div id="nightOverlay" class="night-mode-overlay" style="display:none;">
+          <div class="night-mode-text">Night mode &#10;Camera Offline</div>
+          <button class="btn-primary" style="margin-top:16px; padding:7px 16px; font-size:0.88rem;" onclick="sendCtrl({action:'activate_day_mode'})">
+            ☀️ Activate Day Mode
+          </button>
+        </div>
+
         <div id="roiEditorOverlay">
           <div id="roiSelectionBox">
             <div class="roi-handle roi-handle-nw" data-handle="nw"></div>
@@ -562,7 +915,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div id="primaryTargetVal" class="stat-val">None</div>
           </div>
           <div class="stat-box">
-            <div class="stat-label">Frame Fill (25-40%)</div>
+            <div class="stat-label">Frame Fill (10-35%)</div>
             <div id="targetAreaVal" class="stat-val">0.0%</div>
           </div>
           <div class="stat-box">
@@ -576,29 +929,51 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
       </div>
     </div>
+
+    <!-- LIVE LOGGING PANE (TOGGLEABLE) -->
+    <div id="liveLogsCard" class="card" style="display:none;">
+      <div class="card-header">
+        <span>📜 Live Execution Logs</span>
+        <div style="display:flex; align-items:center; gap:8px;">
+          <label style="font-size:0.75rem; color:var(--muted); font-weight:600;">Level:</label>
+          <select id="logLevelSelect" onchange="changeLogLevel(this.value)" style="padding:2px 8px; font-size:0.75rem;">
+            <option value="INFO" selected>INFO</option>
+            <option value="DEBUG">DEBUG</option>
+          </select>
+          <button id="btnAutoScroll" class="active" onclick="toggleLogAutoScroll()" style="padding:2px 8px; font-size:0.75rem;">Scroll: ON</button>
+          <button onclick="clearLogPane()" style="padding:2px 8px; font-size:0.75rem;">Clear</button>
+          <button onclick="toggleLogsPane()" style="padding:2px 8px; font-size:0.75rem;">✕ Hide</button>
+        </div>
+      </div>
+      <div class="card-body" style="padding:10px;">
+        <div id="logTerminal" class="log-terminal">
+          <div style="color:var(--muted); font-size:0.72rem;">Connecting to live logs...</div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- RIGHT PANE: PTZ GIMBAL CONTROLS & LIFE LIST / GALLERY TABS -->
   <div class="right-pane">
-    <div class="card">
+    <div id="ptzCard" class="card">
       <div class="card-header">
         <span>🎯 OBSBOT PTZ Gimbal & Home Preset</span>
-        <button id="btnUkFilter" class="active" style="padding:4px 9px; font-size:0.75rem;" onclick="sendCtrl({action:'toggle_uk_filter'})">
+        <button id="btnUkFilter" class="active cam-ctrl" style="padding:4px 9px; font-size:0.75rem;" onclick="sendCtrl({action:'toggle_uk_filter'})">
           🇬🇧 UK Filter: ON
         </button>
       </div>
       <div class="card-body">
         <div style="display:flex; flex-wrap:wrap; gap:8px; margin-bottom:10px;">
-          <button id="btnAutoTrack" class="active" style="flex:1;" onclick="sendCtrl({action:'toggle_tracking'})">
+          <button id="btnAutoTrack" class="active cam-ctrl" style="flex:1;" onclick="sendCtrl({action:'toggle_tracking'})">
             🤖 Auto-Framing: ON
           </button>
-          <button onclick="sendCtrl({action:'go_home'})" title="Return to saved feeder/home position">🏠 Go Home</button>
-          <button onclick="saveHomePreset()" title="Save current pan/tilt as the default detection view">📌 Set Home</button>
+          <button class="cam-ctrl" onclick="sendCtrl({action:'go_home'})" title="Return to saved feeder/home position">🏠 Go Home</button>
+          <button class="cam-ctrl" onclick="saveHomePreset()" title="Save current pan/tilt as the default detection view">📌 Set Home</button>
         </div>
 
         <div style="display:flex; justify-content:space-between; align-items:center; font-size:0.74rem; color:var(--muted); font-weight:600; text-transform:uppercase;">
           <span>Manual Jog D-Pad (Pauses Auto-Framing 60s)</span>
-          <select id="nudgeStepSel" style="padding:2px 6px; font-size:0.74rem;">
+          <select id="nudgeStepSel" class="cam-ctrl" style="padding:2px 6px; font-size:0.74rem;">
             <option value="18000">Fine Step</option>
             <option value="36000" selected>Medium Step</option>
             <option value="72000">Large Step</option>
@@ -606,13 +981,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
         <div class="dpad">
           <div></div>
-          <button onclick="nudgePTZ(0, 1)">▲ Up</button>
+          <button class="cam-ctrl" onclick="nudgePTZ(0, 1)">▲ Up</button>
           <div></div>
-          <button onclick="nudgePTZ(1, 0)">◀ Left</button>
-          <button onclick="sendCtrl({action:'center'})">🎯 0,0</button>
-          <button onclick="nudgePTZ(-1, 0)">Right ▶</button>
+          <button class="cam-ctrl" onclick="nudgePTZ(1, 0)">◀ Left</button>
+          <button class="cam-ctrl" onclick="sendCtrl({action:'center'})">🎯 0,0</button>
+          <button class="cam-ctrl" onclick="nudgePTZ(-1, 0)">Right ▶</button>
           <div></div>
-          <button onclick="nudgePTZ(0, -1)">▼ Down</button>
+          <button class="cam-ctrl" onclick="nudgePTZ(0, -1)">▼ Down</button>
           <div></div>
         </div>
 
@@ -621,9 +996,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <span id="fovLbl">65° Narrow</span>
         </div>
         <div style="display:grid; grid-template-columns:repeat(3, 1fr); gap:6px; margin-top:6px;">
-          <button id="btnFov86" onclick="sendCtrl({action:'set_fov', fov:86})">86° Wide</button>
-          <button id="btnFov78" onclick="sendCtrl({action:'set_fov', fov:78})">78° Medium</button>
-          <button id="btnFov65" class="active" onclick="sendCtrl({action:'set_fov', fov:65})">65° Narrow</button>
+          <button id="btnFov86" class="cam-ctrl" onclick="sendCtrl({action:'set_fov', fov:86})">86° Wide</button>
+          <button id="btnFov78" class="cam-ctrl" onclick="sendCtrl({action:'set_fov', fov:78})">78° Medium</button>
+          <button id="btnFov65" class="active cam-ctrl" onclick="sendCtrl({action:'set_fov', fov:65})">65° Narrow</button>
         </div>
 
         <div style="margin-top:10px; font-size:0.74rem; color:var(--muted); font-weight:600; text-transform:uppercase; display:flex; justify-content:space-between;">
@@ -631,16 +1006,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <span id="zoomSliderLbl">1.0x</span>
         </div>
         <div style="display:flex; align-items:center; gap:8px; margin-top:6px;">
-          <button onclick="sendCtrl({action:'zoom_out', step:0.25})">🔍 -</button>
-          <input id="zoomSlider" type="range" min="1.0" max="4.0" step="0.25" value="1.0" style="flex:1;" onchange="sendCtrl({action:'set_zoom', zoom:parseFloat(this.value)})">
-          <button onclick="sendCtrl({action:'zoom_in', step:0.25})">🔍 +</button>
+          <button class="cam-ctrl" onclick="sendCtrl({action:'zoom_out', step:0.25})">🔍 -</button>
+          <input id="zoomSlider" class="cam-ctrl" type="range" min="1.0" max="4.0" step="0.25" value="1.0" style="flex:1;" onchange="sendCtrl({action:'set_zoom', zoom:parseFloat(this.value)})">
+          <button class="cam-ctrl" onclick="sendCtrl({action:'zoom_in', step:0.25})">🔍 +</button>
         </div>
         <div class="zoom-bar">
-          <button onclick="sendCtrl({action:'set_zoom', zoom:1.0})">1.0x</button>
-          <button onclick="sendCtrl({action:'set_zoom', zoom:1.5})">1.5x</button>
-          <button onclick="sendCtrl({action:'set_zoom', zoom:2.0})">2.0x</button>
-          <button onclick="sendCtrl({action:'set_zoom', zoom:3.0})">3.0x</button>
-          <button onclick="sendCtrl({action:'set_zoom', zoom:4.0})">4.0x</button>
+          <button class="cam-ctrl" onclick="sendCtrl({action:'set_zoom', zoom:1.0})">1.0x</button>
+          <button class="cam-ctrl" onclick="sendCtrl({action:'set_zoom', zoom:1.5})">1.5x</button>
+          <button class="cam-ctrl" onclick="sendCtrl({action:'set_zoom', zoom:2.0})">2.0x</button>
+          <button class="cam-ctrl" onclick="sendCtrl({action:'set_zoom', zoom:3.0})">3.0x</button>
+          <button class="cam-ctrl" onclick="sendCtrl({action:'set_zoom', zoom:4.0})">4.0x</button>
         </div>
 
         <div style="margin-top:10px; font-size:0.74rem; color:var(--muted); font-weight:600; text-transform:uppercase; display:flex; justify-content:space-between; align-items:center;">
@@ -648,19 +1023,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <span id="focusLbl">Auto</span>
         </div>
         <div style="display:flex; align-items:center; gap:8px; margin-top:6px;">
-          <button id="btnAutofocus" class="active" style="padding:5px 10px; font-size:0.76rem;" onclick="sendCtrl({action:'toggle_autofocus'})">AF: ON</button>
-          <input id="focusSlider" type="range" min="0" max="100" step="1" value="50" style="flex:1;" onchange="sendCtrl({action:'set_focus', focus:parseInt(this.value, 10)})">
+          <button id="btnAutofocus" class="active cam-ctrl" style="padding:5px 10px; font-size:0.76rem;" onclick="sendCtrl({action:'toggle_autofocus'})">AF: ON</button>
+          <input id="focusSlider" class="cam-ctrl" type="range" min="0" max="100" step="1" value="50" style="flex:1;" onchange="sendCtrl({action:'set_focus', focus:parseInt(this.value, 10)})">
         </div>
 
         <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:10px;">
-          <button id="btnInvPan" onclick="sendCtrl({action:'toggle_invert_pan'})">Invert Pan: ON</button>
-          <button id="btnInvTilt" onclick="sendCtrl({action:'toggle_invert_tilt'})">Invert Tilt: ON</button>
+          <button id="btnInvPan" class="cam-ctrl" onclick="sendCtrl({action:'toggle_invert_pan'})">Invert Pan: ON</button>
+          <button id="btnInvTilt" class="cam-ctrl" onclick="sendCtrl({action:'toggle_invert_tilt'})">Invert Tilt: ON</button>
         </div>
-        <div id="statusToast" class="status-toast"></div>
       </div>
     </div>
 
-    <!-- TABS: BIRD DEX / CAPTURES & REVIEW / ANALYTICS -->
+    <!-- TABS: BIRD DEX / CAPTURES & REVIEW / ANALYTICS (Requirement 1: always available) -->
     <div class="card">
       <div class="tabs">
         <button id="tabBtnDex" class="tab-btn active" onclick="switchTab('dex')">🦉 Bird Dex (<span id="dexCountLbl">0</span>)</button>
@@ -668,7 +1042,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <button id="tabBtnCharts" class="tab-btn" onclick="switchTab('charts')">📈 Analytics</button>
       </div>
 
-      <!-- TAB 1: LIFE LIST / BIRD DEX -->
+      <!-- TAB 1: LIFE LIST / BIRD DEX (Requirement 3: trash can icon on each card) -->
       <div id="tabPanelDex" class="tab-panel active">
         <div id="dexGrid" class="dex-grid">
           <div style="grid-column: 1 / -1; color:var(--muted); text-align:center; padding:20px; font-size:0.86rem;">
@@ -677,10 +1051,25 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- TAB 2: RECENT CAPTURES & MANUAL REVIEW -->
+      <!-- TAB 2: RECENT CAPTURES & BATCH OVERRIDE (Requirement 4: multi-select & batch relabel) -->
       <div id="tabPanelSnaps" class="tab-panel">
-        <div style="font-size:0.76rem; color:var(--muted); margin-bottom:10px;">
-          Click any photograph to view full resolution, inspect species confidence, re-label, or delete false positives.
+        <div id="batchRelabelBar" class="batch-bar">
+          <div style="display:flex; align-items:center; gap:8px;">
+            <label style="display:flex; align-items:center; gap:4px; font-size:0.78rem; cursor:pointer; font-weight:600;">
+              <input type="checkbox" id="selectAllCapturesCb" onchange="toggleSelectAllCaptures(this.checked)">
+              <span>Select All</span>
+            </label>
+            <span id="selectedCapturesCount" style="font-size:0.78rem; color:var(--muted); font-weight:700;">0 selected</span>
+            <button id="btnClearSelection" class="btn-subtle" onclick="clearCapturesSelection()" style="display:none;">Clear</button>
+          </div>
+          <div style="display:flex; align-items:center; gap:6px;">
+            <select id="batchSpeciesSelect" style="padding:4px 8px; font-size:0.78rem; max-width:180px;">
+              <option value="">-- Choose Species --</option>
+            </select>
+            <button id="btnBatchRelabel" class="btn-primary" onclick="batchRelabelSelected()" style="padding:4px 10px; font-size:0.78rem;">
+              Override Species
+            </button>
+          </div>
         </div>
         <div id="snapshotGallery" class="snapshot-gallery"></div>
       </div>
@@ -702,14 +1091,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 </main>
 
-<!-- SNAPSHOT REVIEW / RELABEL / DELETE MODAL -->
+<div id="statusToast" class="status-toast"></div>
+
+<!-- DETAILED CAPTURE POPUP MODAL & DEEP ZOOM (Requirement 5) -->
 <div id="reviewModal" class="modal-backdrop" onclick="if(event.target===this) closeModal()">
   <div class="modal-box">
     <div class="card-header">
       <span id="modalTitle">Sighting Inspection</span>
-      <button onclick="closeModal()" style="padding:4px 10px;">✕ Close</button>
+      <div style="display:flex; align-items:center; gap:8px;">
+        <span id="modalZoomVal" style="font-size:0.75rem; color:var(--muted); font-weight:700;">1.0x</span>
+        <button class="btn-subtle" onclick="resetModalZoom(event)">Reset Zoom</button>
+        <button onclick="closeModal()" style="padding:4px 10px;">✕ Close</button>
+      </div>
     </div>
-    <img id="modalImg" src="" alt="Bird Snapshot">
+    <div id="modalImgFrame" class="modal-img-frame" title="Click or scroll to zoom in/out">
+      <div id="modalZoomPill" class="zoom-indicator-pill">1.0x</div>
+      <img id="modalImg" src="" alt="Bird Snapshot" class="modal-zoom-img">
+    </div>
     <div class="card-body" style="display:flex; flex-direction:column; gap:12px;">
       <div id="modalMeta" style="font-size:0.84rem; color:var(--muted);"></div>
       <div id="modalTopPreds" style="font-size:0.82rem;"></div>
@@ -729,10 +1127,156 @@ let streamHudOn = true;
 let ukCatalog = [];
 let currentSightings = [];
 let selectedSightingId = null;
+let selectedCaptures = new Set();
+let isNightModeActive = false;
 
 let isEditingRoi = false;
 let currentRoiState = null;
 let roiDraft = { x: 0.25, y: 0.25, w: 0.50, h: 0.50 };
+
+/* LOGS STATE */
+let logsPaneOpen = false;
+let logAutoScroll = true;
+let currentLogLevel = "INFO";
+let lastLogSeq = 0;
+let logPollTimer = null;
+
+/* Requirement 2: Pop-out and Fullscreen helpers */
+function openPopout() {
+  window.open('/popout', 'BirdSpotterPopout', 'width=960,height=580,menubar=no,toolbar=no,location=no,status=no,resizable=yes');
+}
+
+function toggleFullscreen() {
+  const vContainer = document.getElementById('videoContainer');
+  if (!vContainer) return;
+  if (!document.fullscreenElement) {
+    if (vContainer.requestFullscreen) {
+      vContainer.requestFullscreen().catch(()=>{});
+    } else if (vContainer.webkitRequestFullscreen) {
+      vContainer.webkitRequestFullscreen();
+    }
+  } else {
+    if (document.exitFullscreen) {
+      document.exitFullscreen().catch(()=>{});
+    }
+  }
+}
+
+function initLogsState() {
+  const savedOpen = localStorage.getItem('spotter_logs_open');
+  if (savedOpen === 'true') {
+    setLogsPaneVisible(true);
+  }
+  const savedLevel = localStorage.getItem('spotter_logs_level');
+  if (savedLevel && (savedLevel === 'INFO' || savedLevel === 'DEBUG')) {
+    currentLogLevel = savedLevel;
+    const sel = document.getElementById('logLevelSelect');
+    if (sel) sel.value = savedLevel;
+  }
+}
+
+function toggleLogsPane() {
+  setLogsPaneVisible(!logsPaneOpen);
+}
+
+function setLogsPaneVisible(visible) {
+  logsPaneOpen = visible;
+  localStorage.setItem('spotter_logs_open', visible ? 'true' : 'false');
+  const card = document.getElementById('liveLogsCard');
+  const btn = document.getElementById('btnToggleLogs');
+  if (card) card.style.display = visible ? 'block' : 'none';
+  if (btn) btn.classList.toggle('active', visible);
+
+  if (visible) {
+    pollLogs();
+    if (!logPollTimer) {
+      logPollTimer = setInterval(pollLogs, 600);
+    }
+  } else {
+    if (logPollTimer) {
+      clearInterval(logPollTimer);
+      logPollTimer = null;
+    }
+  }
+}
+
+function toggleLogAutoScroll() {
+  logAutoScroll = !logAutoScroll;
+  const btn = document.getElementById('btnAutoScroll');
+  if (btn) {
+    btn.textContent = 'Scroll: ' + (logAutoScroll ? 'ON' : 'OFF');
+    btn.classList.toggle('active', logAutoScroll);
+  }
+}
+
+async function changeLogLevel(newLevel) {
+  currentLogLevel = newLevel;
+  localStorage.setItem('spotter_logs_level', newLevel);
+  await sendCtrl({ action: 'set_log_level', level: newLevel });
+  clearLogPane();
+  pollLogs();
+}
+
+function clearLogPane() {
+  const term = document.getElementById('logTerminal');
+  if (term) term.innerHTML = '<div style="color:var(--muted); font-size:0.72rem;">Logs cleared</div>';
+  lastLogSeq = 0;
+}
+
+async function pollLogs() {
+  if (!logsPaneOpen) return;
+  try {
+    const res = await fetch(`/api/logs?since=${lastLogSeq}&level=${currentLogLevel}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    const entries = data.entries || [];
+    if (entries.length === 0) return;
+
+    const term = document.getElementById('logTerminal');
+    if (!term) return;
+
+    if (lastLogSeq === 0) {
+      term.innerHTML = '';
+    }
+
+    const frag = document.createDocumentFragment();
+    for (const e of entries) {
+      lastLogSeq = Math.max(lastLogSeq, e.seq);
+      const row = document.createElement('div');
+      row.className = 'log-line';
+      row.innerHTML =
+        `<span class="log-ts">${escapeHtml(e.ts)}</span>` +
+        `<span class="log-lvl log-lvl-${escapeHtml(e.level)}">${escapeHtml(e.level)}</span>` +
+        `<span class="log-cat">[${escapeHtml(e.category)}]</span>` +
+        `<span class="log-msg">${escapeHtml(e.msg)}</span>`;
+      frag.appendChild(row);
+    }
+    term.appendChild(frag);
+
+    while (term.childNodes.length > 350) {
+      term.removeChild(term.firstChild);
+    }
+
+    if (logAutoScroll) {
+      term.scrollTop = term.scrollHeight;
+    }
+  } catch (err) {}
+}
+
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function escapeJs(str) {
+  if (!str) return '';
+  return String(str).replace(/'/g, "\\'").replace(/"/g, '\\"');
+}
 
 function toggleRoiEditor() {
   if (isEditingRoi) {
@@ -744,343 +1288,516 @@ function toggleRoiEditor() {
 
 function startRoiEditor() {
   isEditingRoi = true;
-  if (currentRoiState && currentRoiState.enabled) {
-    roiDraft.x = currentRoiState.x;
-    roiDraft.y = currentRoiState.y;
-    roiDraft.w = currentRoiState.w;
-    roiDraft.h = currentRoiState.h;
-  } else {
-    roiDraft.x = 0.25;
-    roiDraft.y = 0.25;
-    roiDraft.w = 0.50;
-    roiDraft.h = 0.50;
-  }
-  document.getElementById('roiEditorOverlay').style.display = 'block';
+  document.getElementById('btnEditRoi').textContent = 'Cancel Zone';
+  document.getElementById('btnEditRoi').classList.add('active');
   document.getElementById('btnApplyRoi').style.display = 'inline-block';
-  const lblLock = document.getElementById('lblLockAspect');
-  if (lblLock) lblLock.style.display = 'inline-flex';
-  const editBtn = document.getElementById('btnEditRoi');
-  editBtn.textContent = '❌ Cancel Editing';
-  editBtn.classList.add('active');
-  renderRoiBox();
-  showToast('Drag box to move, drag corners to resize around feeder');
+  document.getElementById('btnClearRoi').style.display = 'inline-block';
+  document.getElementById('lblLockAspect').style.display = 'inline-flex';
+  const ov = document.getElementById('roiEditorOverlay');
+  ov.style.display = 'block';
+
+  if (currentRoiState && currentRoiState.enabled) {
+    roiDraft = {
+      x: currentRoiState.norm_x,
+      y: currentRoiState.norm_y,
+      w: currentRoiState.norm_w,
+      h: currentRoiState.norm_h,
+    };
+  } else {
+    roiDraft = { x: 0.20, y: 0.20, w: 0.60, h: 0.60 };
+  }
+  renderRoiSelectionBox();
 }
 
 function cancelRoiEditor() {
   isEditingRoi = false;
-  document.getElementById('roiEditorOverlay').style.display = 'none';
+  document.getElementById('btnEditRoi').textContent = (currentRoiState && currentRoiState.enabled) ? '🎯 Zone: ON' : '🎯 Select Zone';
+  document.getElementById('btnEditRoi').classList.toggle('active', !!(currentRoiState && currentRoiState.enabled));
   document.getElementById('btnApplyRoi').style.display = 'none';
-  const lblLock = document.getElementById('lblLockAspect');
-  if (lblLock) lblLock.style.display = 'none';
-  const editBtn = document.getElementById('btnEditRoi');
-  editBtn.textContent = (currentRoiState && currentRoiState.enabled) ? '🎯 Zone: ON' : '🎯 Select Zone';
-  if (!(currentRoiState && currentRoiState.enabled)) {
-    editBtn.classList.remove('active');
-  }
+  document.getElementById('btnClearRoi').style.display = (currentRoiState && currentRoiState.enabled) ? 'inline-block' : 'none';
+  document.getElementById('lblLockAspect').style.display = 'none';
+  const ov = document.getElementById('roiEditorOverlay');
+  ov.style.display = 'none';
+  document.getElementById('roiSelectionBox').style.display = 'none';
 }
 
-async function applyRoiSelection() {
-  const lockAspect = document.getElementById('chkLockAspect') ? document.getElementById('chkLockAspect').checked : false;
-  const payload = {
+function renderRoiSelectionBox() {
+  const box = document.getElementById('roiSelectionBox');
+  box.style.left = (roiDraft.x * 100).toFixed(2) + '%';
+  box.style.top = (roiDraft.y * 100).toFixed(2) + '%';
+  box.style.width = (roiDraft.w * 100).toFixed(2) + '%';
+  box.style.height = (roiDraft.h * 100).toFixed(2) + '%';
+  box.style.display = 'block';
+}
+
+function applyRoiSelection() {
+  const lock = document.getElementById('chkLockAspect').checked;
+  sendCtrl({
     action: 'set_roi',
     x: roiDraft.x,
     y: roiDraft.y,
     w: roiDraft.w,
     h: roiDraft.h,
-    lock_aspect: lockAspect,
-  };
-  await sendCtrl(payload);
-  isEditingRoi = false;
-  document.getElementById('roiEditorOverlay').style.display = 'none';
-  document.getElementById('btnApplyRoi').style.display = 'none';
-  const lblLock = document.getElementById('lblLockAspect');
-  if (lblLock) lblLock.style.display = 'none';
-  showToast('Zone of Interest set and saved!');
+    lock_aspect: lock
+  });
+  cancelRoiEditor();
+  showToast('Zone of Interest saved');
 }
 
-async function clearRoiSelection() {
-  await sendCtrl({ action: 'clear_roi' });
-  isEditingRoi = false;
-  document.getElementById('roiEditorOverlay').style.display = 'none';
-  document.getElementById('btnApplyRoi').style.display = 'none';
-  const lblLock = document.getElementById('lblLockAspect');
-  if (lblLock) lblLock.style.display = 'none';
+function clearRoiSelection() {
+  sendCtrl({ action: 'clear_roi' });
+  cancelRoiEditor();
   showToast('Zone of Interest cleared');
 }
 
-function renderRoiBox() {
+/* ROI drag setup */
+(function setupRoiInteractions() {
+  const ov = document.getElementById('roiEditorOverlay');
   const box = document.getElementById('roiSelectionBox');
-  if (!box) return;
-  box.style.left = (roiDraft.x * 100) + '%';
-  box.style.top = (roiDraft.y * 100) + '%';
-  box.style.width = (roiDraft.w * 100) + '%';
-  box.style.height = (roiDraft.h * 100) + '%';
-}
+  let activeHandle = null;
+  let isDraggingBox = false;
+  let startX = 0, startY = 0;
+  let startDraft = { ...roiDraft };
 
-(function initRoiInteractions() {
-  const overlay = document.getElementById('roiEditorOverlay');
-  const box = document.getElementById('roiSelectionBox');
-  if (!overlay || !box) return;
-
-  let dragMode = null; // 'move', 'nw', 'ne', 'sw', 'se'
-  let startX = 0;
-  let startY = 0;
-  let initX = 0;
-  let initY = 0;
-  let initW = 0;
-  let initH = 0;
-
-  function onPointerDown(e) {
-    if (!isEditingRoi) return;
-    const handle = e.target.closest('.roi-handle');
-    if (handle) {
-      dragMode = handle.dataset.handle;
-    } else if (e.target.closest('#roiSelectionBox')) {
-      dragMode = 'move';
-    } else {
+  ov.addEventListener('mousedown', (e) => {
+    if (e.target.classList.contains('roi-handle')) {
+      activeHandle = e.target.dataset.handle;
+      startX = e.clientX;
+      startY = e.clientY;
+      startDraft = { ...roiDraft };
+      e.stopPropagation();
       return;
     }
+    if (e.target === box || box.contains(e.target)) {
+      isDraggingBox = true;
+      startX = e.clientX;
+      startY = e.clientY;
+      startDraft = { ...roiDraft };
+      e.stopPropagation();
+      return;
+    }
+    const rect = ov.getBoundingClientRect();
+    const nx = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    const ny = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
+    roiDraft = { x: nx, y: ny, w: 0.05, h: 0.05 };
+    activeHandle = 'se';
     startX = e.clientX;
     startY = e.clientY;
-    initX = roiDraft.x;
-    initY = roiDraft.y;
-    initW = roiDraft.w;
-    initH = roiDraft.h;
+    startDraft = { ...roiDraft };
+    renderRoiSelectionBox();
+  });
 
-    try {
-      box.setPointerCapture(e.pointerId);
-    } catch (err) {}
-    e.preventDefault();
-    e.stopPropagation();
-  }
-
-  function onPointerMove(e) {
-    if (!dragMode) return;
-    const rect = overlay.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) return;
-
-    const dx = (e.clientX - startX) / rect.width;
-    const dy = (e.clientY - startY) / rect.height;
-    const lockAspect = document.getElementById('chkLockAspect') ? document.getElementById('chkLockAspect').checked : false;
-
-    if (dragMode === 'move') {
-      const maxX = 1.0 - initW;
-      const maxY = 1.0 - initH;
-      roiDraft.x = Math.round(Math.max(0.0, Math.min(maxX, initX + dx)) * 10000) / 10000;
-      roiDraft.y = Math.round(Math.max(0.0, Math.min(maxY, initY + dy)) * 10000) / 10000;
-    } else if (lockAspect) {
-      // 16:9 locked mode (w === h in normalized overlay)
-      const initS = (initW + initH) * 0.5;
-      if (dragMode === 'se') {
-        const ds = (dx + dy) * 0.5;
-        const maxS = Math.min(1.0 - initX, 1.0 - initY);
-        const s = Math.round(Math.max(0.10, Math.min(maxS, initS + ds)) * 10000) / 10000;
-        roiDraft.x = initX;
-        roiDraft.y = initY;
-        roiDraft.w = s;
-        roiDraft.h = s;
-      } else if (dragMode === 'nw') {
-        const anchorX = initX + initS;
-        const anchorY = initY + initS;
-        const ds = (-dx + -dy) * 0.5;
-        const maxS = Math.min(anchorX, anchorY);
-        const s = Math.round(Math.max(0.10, Math.min(maxS, initS + ds)) * 10000) / 10000;
-        roiDraft.w = s;
-        roiDraft.h = s;
-        roiDraft.x = Math.round((anchorX - s) * 10000) / 10000;
-        roiDraft.y = Math.round((anchorY - s) * 10000) / 10000;
-      } else if (dragMode === 'ne') {
-        const anchorX = initX;
-        const anchorY = initY + initS;
-        const ds = (dx + -dy) * 0.5;
-        const maxS = Math.min(1.0 - anchorX, anchorY);
-        const s = Math.round(Math.max(0.10, Math.min(maxS, initS + ds)) * 10000) / 10000;
-        roiDraft.w = s;
-        roiDraft.h = s;
-        roiDraft.x = anchorX;
-        roiDraft.y = Math.round((anchorY - s) * 10000) / 10000;
-      } else if (dragMode === 'sw') {
-        const anchorX = initX + initS;
-        const anchorY = initY;
-        const ds = (-dx + dy) * 0.5;
-        const maxS = Math.min(anchorX, 1.0 - anchorY);
-        const s = Math.round(Math.max(0.10, Math.min(maxS, initS + ds)) * 10000) / 10000;
-        roiDraft.w = s;
-        roiDraft.h = s;
-        roiDraft.x = Math.round((anchorX - s) * 10000) / 10000;
-        roiDraft.y = anchorY;
-      }
-    } else {
-      // Free aspect ratio resize
-      if (dragMode === 'se') {
-        const nw = Math.max(0.10, Math.min(1.0 - initX, initW + dx));
-        const nh = Math.max(0.10, Math.min(1.0 - initY, initH + dy));
-        roiDraft.x = initX;
-        roiDraft.y = initY;
-        roiDraft.w = Math.round(nw * 10000) / 10000;
-        roiDraft.h = Math.round(nh * 10000) / 10000;
-      } else if (dragMode === 'sw') {
-        const nw = Math.max(0.10, Math.min(initX + initW, initW - dx));
-        const nh = Math.max(0.10, Math.min(1.0 - initY, initH + dy));
-        roiDraft.w = Math.round(nw * 10000) / 10000;
-        roiDraft.x = Math.round((initX + initW - nw) * 10000) / 10000;
-        roiDraft.y = initY;
-        roiDraft.h = Math.round(nh * 10000) / 10000;
-      } else if (dragMode === 'ne') {
-        const nw = Math.max(0.10, Math.min(1.0 - initX, initW + dx));
-        const nh = Math.max(0.10, Math.min(initY + initH, initH - dy));
-        roiDraft.x = initX;
-        roiDraft.w = Math.round(nw * 10000) / 10000;
-        roiDraft.h = Math.round(nh * 10000) / 10000;
-        roiDraft.y = Math.round((initY + initH - nh) * 10000) / 10000;
-      } else if (dragMode === 'nw') {
-        const nw = Math.max(0.10, Math.min(initX + initW, initW - dx));
-        const nh = Math.max(0.10, Math.min(initY + initH, initH - dy));
-        roiDraft.w = Math.round(nw * 10000) / 10000;
-        roiDraft.h = Math.round(nh * 10000) / 10000;
-        roiDraft.x = Math.round((initX + initW - nw) * 10000) / 10000;
-        roiDraft.y = Math.round((initY + initH - nh) * 10000) / 10000;
-      }
+  window.addEventListener('mousemove', (e) => {
+    if (!isEditingRoi) return;
+    const rect = ov.getBoundingClientRect();
+    if (isDraggingBox) {
+      const dx = (e.clientX - startX) / rect.width;
+      const dy = (e.clientY - startY) / rect.height;
+      roiDraft.x = Math.max(0, Math.min(1 - startDraft.w, startDraft.x + dx));
+      roiDraft.y = Math.max(0, Math.min(1 - startDraft.h, startDraft.y + dy));
+      renderRoiSelectionBox();
+      return;
     }
+    if (activeHandle) {
+      const dx = (e.clientX - startX) / rect.width;
+      const dy = (e.clientY - startY) / rect.height;
+      let x1 = startDraft.x;
+      let y1 = startDraft.y;
+      let x2 = startDraft.x + startDraft.w;
+      let y2 = startDraft.y + startDraft.h;
 
-    renderRoiBox();
-  }
+      if (activeHandle === 'nw') { x1 += dx; y1 += dy; }
+      else if (activeHandle === 'ne') { x2 += dx; y1 += dy; }
+      else if (activeHandle === 'sw') { x1 += dx; y2 += dy; }
+      else if (activeHandle === 'se') { x2 += dx; y2 += dy; }
 
-  function onPointerUp(e) {
-    if (dragMode) {
-      try {
-        box.releasePointerCapture(e.pointerId);
-      } catch (err) {}
-      dragMode = null;
+      const nx1 = Math.max(0, Math.min(x1, x2));
+      const nx2 = Math.min(1, Math.max(x1, x2));
+      const ny1 = Math.max(0, Math.min(y1, y2));
+      const ny2 = Math.min(1, Math.max(y1, y2));
+      roiDraft = {
+        x: nx1,
+        y: ny1,
+        w: Math.max(0.04, nx2 - nx1),
+        h: Math.max(0.04, ny2 - ny1)
+      };
+      renderRoiSelectionBox();
     }
-  }
+  });
 
-  box.addEventListener('pointerdown', onPointerDown);
-  window.addEventListener('pointermove', onPointerMove);
-  window.addEventListener('pointerup', onPointerUp);
-  window.addEventListener('pointercancel', onPointerUp);
+  window.addEventListener('mouseup', () => {
+    activeHandle = null;
+    isDraggingBox = false;
+  });
 })();
 
-async function loadCatalog() {
+async function sendCtrl(payload) {
   try {
-    const res = await fetch('/api/catalog');
+    const res = await fetch('/api/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
     if (res.ok) {
-      ukCatalog = await res.json();
-      const sel = document.getElementById('relabelSelect');
-      sel.innerHTML = ukCatalog.map(item =>
-        `<option value="${item.species}">${item.species} (${item.scientific_name})</option>`
-      ).join('');
+      const st = await res.json();
+      updateUI(st);
     }
-  } catch (e) {}
-}
-loadCatalog();
-
-function switchTab(tab) {
-  for (const t of ['dex', 'snaps', 'charts']) {
-    document.getElementById('tabBtn' + t.charAt(0).toUpperCase() + t.slice(1)).classList.toggle('active', t === tab);
-    document.getElementById('tabPanel' + t.charAt(0).toUpperCase() + t.slice(1)).classList.toggle('active', t === tab);
+  } catch (err) {
+    console.error('sendCtrl failed', err);
   }
 }
 
-function updateStreamSrc() {
-  const img = document.getElementById('streamImg');
-  if (!camPreviewOn) {
-    img.src = '';
-    return;
+function togglePowerOrDayNight() {
+  if (isNightModeActive) {
+    sendCtrl({ action: 'activate_day_mode' });
+  } else {
+    sendCtrl({ action: 'toggle_system_power' });
   }
-  const cleanParam = streamHudOn ? '0' : '1';
-  img.src = `/stream.mjpg?clean=${cleanParam}&t=${Date.now()}`;
+}
+
+function nudgePTZ(dp, dt) {
+  const step = parseInt(document.getElementById('nudgeStepSel').value, 10) || 36000;
+  sendCtrl({ action: 'nudge', d_pan: dp * step, d_tilt: dt * step });
+}
+
+function saveHomePreset() {
+  sendCtrl({ action: 'save_home_preset' });
+  showToast('Current PTZ position saved as Home Preset');
+}
+
+async function takeSnapshot() {
+  try {
+    const res = await fetch('/api/snapshot', { method: 'POST' });
+    const data = await res.json();
+    if (data.success) {
+      showToast(`Snapshot captured: ${data.species || data.filename}`);
+    } else {
+      showToast('Snapshot failed (camera sleeping or busy)');
+    }
+  } catch (err) {
+    showToast('Snapshot error');
+  }
 }
 
 function toggleCamPreview() {
   camPreviewOn = !camPreviewOn;
   const img = document.getElementById('streamImg');
-  const offText = document.getElementById('streamOffText');
+  const txt = document.getElementById('streamOffText');
   const btn = document.getElementById('btnToggleCam');
   if (camPreviewOn) {
-    updateStreamSrc();
+    img.src = streamHudOn ? '/stream.mjpg' : '/stream.mjpg?clean=1';
     img.style.display = 'block';
-    offText.style.display = 'none';
+    txt.style.display = 'none';
     btn.textContent = 'Stream: ON';
-    btn.className = 'active';
+    btn.classList.add('active');
   } else {
     img.src = '';
     img.style.display = 'none';
-    offText.style.display = 'block';
+    txt.style.display = 'flex';
     btn.textContent = 'Stream: OFF';
-    btn.className = '';
+    btn.classList.remove('active');
   }
 }
 
 function toggleStreamHud() {
   streamHudOn = !streamHudOn;
   const btn = document.getElementById('btnHudMode');
-  btn.textContent = 'HUD: ' + (streamHudOn ? 'ON' : 'CLEAN');
-  btn.className = streamHudOn ? 'active' : '';
-  if (camPreviewOn) updateStreamSrc();
-}
-
-function nudgePTZ(panSign, tiltSign) {
-  const step = parseInt(document.getElementById('nudgeStepSel').value || '36000', 10);
-  sendCtrl({action: 'nudge', d_pan: panSign * step, d_tilt: roundTilt(tiltSign * step)});
-}
-
-function roundTilt(val) {
-  return Math.round(val * 0.8);
-}
-
-async function saveHomePreset() {
-  await sendCtrl({action: 'save_home_preset'});
-  const z = document.getElementById('zoomVal').textContent;
-  showToast(`Saved current Pan, Tilt & Zoom (${z}) as Home Preset!`);
-}
-
-async function sendCtrl(payload) {
-  try {
-    const res = await fetch('/api/control', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(payload)
-    });
-    const st = await res.json();
-    updateUI(st);
-  } catch (e) {
-    console.error(e);
+  btn.textContent = 'HUD: ' + (streamHudOn ? 'ON' : 'OFF');
+  btn.classList.toggle('active', streamHudOn);
+  if (camPreviewOn) {
+    document.getElementById('streamImg').src = streamHudOn ? '/stream.mjpg' : '/stream.mjpg?clean=1';
   }
 }
 
-async function takeSnapshot() {
-  try {
-    showToast('Capturing clean high-res snapshot...');
-    const res = await fetch('/api/snapshot', { method: 'POST' });
-    const data = await res.json();
-    if (data.success) {
-      showToast(`Saved: ${data.species || 'Bird'} (${data.filename})`);
-    } else {
-      showToast('Snapshot failed');
-    }
-  } catch (e) {
-    showToast('Error taking snapshot');
-  }
+function switchTab(tab) {
+  document.getElementById('tabBtnDex').classList.toggle('active', tab === 'dex');
+  document.getElementById('tabBtnSnaps').classList.toggle('active', tab === 'snaps');
+  document.getElementById('tabBtnCharts').classList.toggle('active', tab === 'charts');
+
+  document.getElementById('tabPanelDex').classList.toggle('active', tab === 'dex');
+  document.getElementById('tabPanelSnaps').classList.toggle('active', tab === 'snaps');
+  document.getElementById('tabPanelCharts').classList.toggle('active', tab === 'charts');
 }
 
 function showToast(msg) {
   const el = document.getElementById('statusToast');
   if (!el) return;
   el.textContent = msg;
+  el.style.display = 'block';
   setTimeout(() => {
-    if (el.textContent === msg) el.textContent = '';
+    if (el.textContent === msg) el.style.display = 'none';
   }, 4000);
 }
+
+/* Requirement 3: Bird Dex deletion */
+async function deleteDexSpecies(species) {
+  if (!confirm(`Delete all records and photos for "${species}"?`)) return;
+  try {
+    const res = await fetch('/api/dex/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ species })
+    });
+    const data = await res.json();
+    if (data.success) {
+      showToast(`Deleted ${data.count} records for ${species}`);
+      const sRes = await fetch('/api/state');
+      if (sRes.ok) updateUI(await sRes.json());
+    } else {
+      showToast('No records were deleted');
+    }
+  } catch (e) {
+    showToast('Network error deleting species');
+  }
+}
+
+/* Requirement 4: Captures Multi-Select & Batch Relabel */
+function toggleCaptureSelected(id, checked) {
+  if (checked) {
+    selectedCaptures.add(id);
+  } else {
+    selectedCaptures.delete(id);
+  }
+  updateCapturesSelectionUI();
+}
+
+function onSnapCardClick(event, id) {
+  if (event.target && (event.target.classList.contains('snap-select-cb') || event.target.tagName === 'INPUT')) {
+    return;
+  }
+  openModalById(id);
+}
+
+function toggleSelectAllCaptures(checked) {
+  if (checked) {
+    currentSightings.forEach(s => selectedCaptures.add(s.id));
+  } else {
+    selectedCaptures.clear();
+  }
+  updateCapturesSelectionUI();
+}
+
+function clearCapturesSelection() {
+  selectedCaptures.clear();
+  updateCapturesSelectionUI();
+}
+
+function updateCapturesSelectionUI() {
+  const count = selectedCaptures.size;
+  const countLbl = document.getElementById('selectedCapturesCount');
+  if (countLbl) countLbl.textContent = `${count} selected`;
+
+  const clearBtn = document.getElementById('btnClearSelection');
+  if (clearBtn) clearBtn.style.display = count > 0 ? 'inline-block' : 'none';
+
+  const selectAllCb = document.getElementById('selectAllCapturesCb');
+  if (selectAllCb) {
+    selectAllCb.checked = (currentSightings.length > 0 && count === currentSightings.length);
+  }
+
+  // Update classes and checkbox states in gallery
+  document.querySelectorAll('.snap-card').forEach(card => {
+    const cb = card.querySelector('.snap-select-cb');
+    if (cb) {
+      const id = parseInt(cb.dataset.id, 10);
+      const isSel = selectedCaptures.has(id);
+      cb.checked = isSel;
+      card.classList.toggle('selected', isSel);
+    }
+  });
+}
+
+async function batchRelabelSelected() {
+  if (selectedCaptures.size === 0) {
+    showToast('Please select at least one capture to override.');
+    return;
+  }
+  const sel = document.getElementById('batchSpeciesSelect');
+  const newSp = sel ? sel.value.trim() : '';
+  if (!newSp) {
+    showToast('Please choose a replacement species from the dropdown.');
+    return;
+  }
+  const count = selectedCaptures.size;
+  // Exact requirement: with an "Are you sure?" confirmation
+  const confirmed = confirm(`Are you sure? This will override classification to "${newSp}" for ${count} selected capture(s).`);
+  if (!confirmed) return;
+
+  try {
+    const res = await fetch('/api/sightings/batch_relabel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: Array.from(selectedCaptures), species: newSp })
+    });
+    const data = await res.json();
+    if (data.success) {
+      showToast(`Successfully relabeled ${data.count} captures to "${newSp}"`);
+      selectedCaptures.clear();
+      updateCapturesSelectionUI();
+      const sRes = await fetch('/api/state');
+      if (sRes.ok) updateUI(await sRes.json());
+    } else {
+      showToast('Batch override failed');
+    }
+  } catch (e) {
+    showToast('Network error during batch override');
+  }
+}
+
+/* Requirement 5: Detailed Capture Popup & Deep-Zoom */
+let modalZoom = 1.0;
+let modalPanX = 0;
+let modalPanY = 0;
+let isPanningModal = false;
+let panStartX = 0, panStartY = 0;
+let pinchStartDist = null;
+let pinchStartZoom = 1.0;
+
+function resetModalZoom(e) {
+  if (e) e.stopPropagation();
+  modalZoom = 1.0;
+  modalPanX = 0;
+  modalPanY = 0;
+  applyModalZoomTransform();
+}
+
+function applyModalZoomTransform() {
+  const img = document.getElementById('modalImg');
+  const frame = document.getElementById('modalImgFrame');
+  const pill = document.getElementById('modalZoomPill');
+  const valLbl = document.getElementById('modalZoomVal');
+
+  if (img) {
+    img.style.transform = `scale(${modalZoom}) translate(${modalPanX / modalZoom}px, ${modalPanY / modalZoom}px)`;
+  }
+  if (frame) {
+    frame.classList.toggle('zoomed-in', modalZoom > 1.05);
+  }
+  const text = `${modalZoom.toFixed(1)}x`;
+  if (pill) pill.textContent = text;
+  if (valLbl) valLbl.textContent = text;
+}
+
+function clampModalPan() {
+  const frame = document.getElementById('modalImgFrame');
+  if (!frame) return;
+  const maxPanX = (frame.clientWidth * (modalZoom - 1.0)) / 2;
+  const maxPanY = (frame.clientHeight * (modalZoom - 1.0)) / 2;
+  modalPanX = Math.max(-maxPanX, Math.min(maxPanX, modalPanX));
+  modalPanY = Math.max(-maxPanY, Math.min(maxPanY, modalPanY));
+}
+
+(function setupModalDeepZoom() {
+  const frame = document.getElementById('modalImgFrame');
+  if (!frame) return;
+
+  // 1) Click to zoom in / out
+  frame.addEventListener('click', (e) => {
+    if (isPanningModal) return;
+    if (modalZoom <= 1.05) {
+      modalZoom = 2.5;
+      modalPanX = 0;
+      modalPanY = 0;
+    } else {
+      modalZoom = 1.0;
+      modalPanX = 0;
+      modalPanY = 0;
+    }
+    applyModalZoomTransform();
+  });
+
+  // 2) Mouse scroll wheel zoom in / out
+  frame.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const prevZoom = modalZoom;
+    const delta = e.deltaY < 0 ? 0.35 : -0.35;
+    modalZoom = Math.max(1.0, Math.min(6.0, modalZoom + delta));
+    if (modalZoom <= 1.0) {
+      modalPanX = 0;
+      modalPanY = 0;
+    } else {
+      clampModalPan();
+    }
+    applyModalZoomTransform();
+  }, { passive: false });
+
+  // 3) Mouse drag when zoomed in
+  frame.addEventListener('mousedown', (e) => {
+    if (modalZoom > 1.05 && e.button === 0) {
+      isPanningModal = true;
+      panStartX = e.clientX - modalPanX;
+      panStartY = e.clientY - modalPanY;
+      e.preventDefault();
+    }
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    if (isPanningModal) {
+      modalPanX = e.clientX - panStartX;
+      modalPanY = e.clientY - panStartY;
+      clampModalPan();
+      applyModalZoomTransform();
+    }
+  });
+
+  window.addEventListener('mouseup', () => {
+    setTimeout(() => { isPanningModal = false; }, 20);
+  });
+
+  // 4) Mobile pinch action & touch pan
+  frame.addEventListener('touchstart', (e) => {
+    if (e.touches.length === 2) {
+      pinchStartDist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      );
+      pinchStartZoom = modalZoom;
+    } else if (e.touches.length === 1 && modalZoom > 1.05) {
+      isPanningModal = true;
+      panStartX = e.touches[0].clientX - modalPanX;
+      panStartY = e.touches[0].clientY - modalPanY;
+    }
+  }, { passive: false });
+
+  frame.addEventListener('touchmove', (e) => {
+    if (e.touches.length === 2 && pinchStartDist) {
+      e.preventDefault();
+      const currentDist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      );
+      const ratio = currentDist / pinchStartDist;
+      modalZoom = Math.max(1.0, Math.min(6.0, pinchStartZoom * ratio));
+      if (modalZoom <= 1.0) {
+        modalPanX = 0;
+        modalPanY = 0;
+      }
+      applyModalZoomTransform();
+    } else if (e.touches.length === 1 && isPanningModal) {
+      e.preventDefault();
+      modalPanX = e.touches[0].clientX - panStartX;
+      modalPanY = e.touches[0].clientY - panStartY;
+      clampModalPan();
+      applyModalZoomTransform();
+    }
+  }, { passive: false });
+
+  frame.addEventListener('touchend', (e) => {
+    if (e.touches.length < 2) pinchStartDist = null;
+    if (e.touches.length === 0) isPanningModal = false;
+  });
+})();
 
 function openModalById(id) {
   const item = currentSightings.find(s => s.id === id);
   if (!item) return;
   selectedSightingId = item.id;
-  document.getElementById('modalTitle').textContent = `#${item.id} — ${item.species} (${(item.species_confidence * 100 || item.yolo_confidence * 100).toFixed(0)}%)`;
-  document.getElementById('modalImg').src = '/snapshots/' + encodeURI(item.snapshot_filename);
+  resetModalZoom();
+
+  document.getElementById('modalTitle').textContent = `#${item.id} — ${item.species} (${((item.species_confidence || item.yolo_confidence || 0) * 100).toFixed(0)}%)`;
+  document.getElementById('modalImg').src = '/snapshots/' + encodeURI(item.snapshot_filename || item.thumb_filename || '');
   document.getElementById('modalMeta').innerHTML =
-    `<strong>Timestamp:</strong> ${item.timestamp} &nbsp;|&nbsp; ` +
+    `<strong>Timestamp:</strong> ${item.timestamp || 'N/A'} &nbsp;|&nbsp; ` +
     `<strong>Scientific:</strong> <em>${item.scientific_name || 'N/A'}</em> &nbsp;|&nbsp; ` +
     `<strong>Zoom:</strong> ${(item.zoom_level || 1.0).toFixed(1)}x &nbsp;|&nbsp; ` +
     `<strong>Sharpness:</strong> ${(item.sharpness || 0).toFixed(0)} &nbsp;|&nbsp; ` +
@@ -1102,6 +1819,7 @@ function openModalById(id) {
 
 function closeModal() {
   document.getElementById('reviewModal').classList.remove('open');
+  resetModalZoom();
   selectedSightingId = null;
 }
 
@@ -1110,12 +1828,14 @@ async function submitRelabel() {
   const newSp = document.getElementById('relabelSelect').value;
   const res = await fetch('/api/sighting/relabel', {
     method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({id: selectedSightingId, species: newSp})
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: selectedSightingId, species: newSp })
   });
   if (res.ok) {
     showToast('Re-labeled sighting to ' + newSp);
     closeModal();
+    const sRes = await fetch('/api/state');
+    if (sRes.ok) updateUI(await sRes.json());
   }
 }
 
@@ -1124,12 +1844,14 @@ async function submitDelete() {
   if (!confirm('Delete this sighting and remove its snapshot from disk?')) return;
   const res = await fetch('/api/sighting/delete', {
     method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({id: selectedSightingId})
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: selectedSightingId })
   });
   if (res.ok) {
     showToast('Deleted sighting #' + selectedSightingId);
     closeModal();
+    const sRes = await fetch('/api/state');
+    if (sRes.ok) updateUI(await sRes.json());
   }
 }
 
@@ -1146,8 +1868,43 @@ function renderBars(containerId, values, labels) {
   }).join('');
 }
 
+function setCameraControlsDisabled(disabled) {
+  const ptzCard = document.getElementById('ptzCard');
+  if (ptzCard) {
+    ptzCard.classList.toggle('controls-disabled', disabled);
+  }
+  document.querySelectorAll('.cam-ctrl').forEach(el => {
+    el.disabled = disabled;
+  });
+}
+
 function updateUI(st) {
   if (!st) return;
+
+  // Requirement 1: Night mode check
+  const isNight = !!st.is_night_mode;
+  isNightModeActive = isNight;
+  const nightOverlay = document.getElementById('nightOverlay');
+  const streamImg = document.getElementById('streamImg');
+  const btnPopout = document.getElementById('btnPopout');
+  const btnFullscreen = document.getElementById('btnFullscreen');
+  const streamOffText = document.getElementById('streamOffText');
+
+  if (isNight) {
+    if (nightOverlay) nightOverlay.style.display = 'flex';
+    if (streamImg) streamImg.style.display = 'none';
+    if (streamOffText) streamOffText.style.display = 'none';
+    if (btnPopout) btnPopout.style.display = 'none';
+    if (btnFullscreen) btnFullscreen.style.display = 'none';
+    setCameraControlsDisabled(true);
+  } else {
+    if (nightOverlay) nightOverlay.style.display = 'none';
+    if (camPreviewOn && streamImg) streamImg.style.display = 'block';
+    if (btnPopout) btnPopout.style.display = 'inline-block';
+    if (btnFullscreen) btnFullscreen.style.display = 'inline-block';
+    setCameraControlsDisabled(!st.system_power_on);
+  }
+
   document.getElementById('fpsVal').textContent = (st.fps || 0).toFixed(1);
   document.getElementById('inferVal').textContent = (st.infer_ms || 0).toFixed(1) + ' ms';
   const zm = st.zoom || 1.0;
@@ -1164,106 +1921,80 @@ function updateUI(st) {
     `Classifier: ${st.classifier_backend || 'Hailo/ONNX'} (${st.uk_filter_enabled ? 'UK Garden Mask' : 'All 707 EU'})`;
 
   const fsmBadge = document.getElementById('fsmBadge');
-  fsmBadge.textContent = st.fsm_label || (st.tracking_enabled ? 'AUTO-FRAMING: ON' : 'MANUAL');
-  fsmBadge.className = 'badge ' + (st.fsm_state === 'MANUAL_OVERRIDE' ? 'badge-warn' : 'badge-active');
-
-  const banner = document.getElementById('overrideBanner');
-  if (st.fsm_state === 'MANUAL_OVERRIDE' && st.manual_override_remaining > 0) {
-    banner.style.display = 'flex';
-    document.getElementById('overrideText').textContent =
-      `Manual PTZ Override Active — Auto-framing resumes in ${Math.ceil(st.manual_override_remaining)}s`;
+  if (isNight) {
+    fsmBadge.textContent = 'NIGHT MODE (CAMERA OFFLINE)';
+    fsmBadge.className = 'badge badge-night';
   } else {
-    banner.style.display = 'none';
-  }
-
-  const targetBadge = document.getElementById('targetBadge');
-  if (st.primary_target) {
-    targetBadge.textContent = 'TARGET: ' + st.primary_target;
-    targetBadge.className = 'badge badge-active';
-  } else {
-    targetBadge.textContent = 'TARGET: NONE';
-    targetBadge.className = 'badge badge-idle';
-  }
-
-  const btnSolar = document.getElementById('btnSolar');
-  if (btnSolar && st.solar) {
-    const s = st.solar;
-    if (!s.enabled) {
-      btnSolar.className = 'badge badge-idle';
-      btnSolar.textContent = '🌅 Auto-Sleep: OFF';
-      btnSolar.title = 'Solar Scheduler is disabled. Click to enable automatic sunset sleep & dawn wake.';
-    } else if (s.is_night) {
-      btnSolar.className = 'badge badge-warn';
-      btnSolar.textContent = `🌙 NIGHT SLEEP (Wakes ${s.wake_time || '--:--'})`;
-      btnSolar.title = `Night Sleep Active (${s.location || 'Local'})\nDawn: ${s.dawn} | Sunrise: ${s.sunrise}\nSunset: ${s.sunset}\nWake (-30m): ${s.wake_time}\nSleep (+30m): ${s.sleep_time}\nSource: ${s.source}`;
-    } else {
-      btnSolar.className = 'badge badge-active';
-      btnSolar.textContent = `🌅 Day Mode (Sleeps ${s.sleep_time || '--:--'})`;
-      btnSolar.title = `Day Active (${s.location || 'Local'})\nDawn: ${s.dawn} | Sunrise: ${s.sunrise}\nSunset: ${s.sunset}\nWake (-30m): ${s.wake_time}\nSleep (+30m): ${s.sleep_time}\nSource: ${s.source}`;
-    }
+    fsmBadge.textContent = st.fsm_label || (st.tracking_enabled ? 'AUTO-FRAMING: ON' : 'MANUAL');
+    fsmBadge.className = 'badge ' + (st.fsm_state === 'MANUAL_OVERRIDE' ? 'badge-warn' : 'badge-active');
   }
 
   const pwrBtn = document.getElementById('pwrBtn');
-  const isOn = st.system_power_on !== false;
-  pwrBtn.className = 'power-btn ' + (isOn ? 'power-on' : 'power-off');
-  pwrBtn.textContent = isOn ? '⏻ CAM ACTIVE' : '⏻ CAM STANDBY';
+  if (isNight) {
+    pwrBtn.textContent = '🌙 NIGHT MODE';
+    pwrBtn.className = 'power-btn power-off';
+  } else if (st.system_power_on) {
+    pwrBtn.textContent = '⏻ CAM ACTIVE';
+    pwrBtn.className = 'power-btn power-on';
+  } else {
+    pwrBtn.textContent = '⏻ CAM STANDBY';
+    pwrBtn.className = 'power-btn power-off';
+  }
+
+  const btnSolar = document.getElementById('btnSolar');
+  if (st.solar) {
+    const s = st.solar;
+    btnSolar.textContent = s.enabled ? `🌅 ${s.state === 'night_sleep' ? 'Night Sleep' : 'Day Active'}` : '🌅 Auto-Sleep: OFF';
+    btnSolar.classList.toggle('badge-active', s.enabled);
+    btnSolar.classList.toggle('badge-idle', !s.enabled);
+  }
 
   const btnAutoTrack = document.getElementById('btnAutoTrack');
-  btnAutoTrack.textContent = '🤖 Auto-Framing: ' + (st.tracking_enabled ? 'ON' : 'LOCKED OFF');
-  btnAutoTrack.className = st.tracking_enabled ? 'active' : '';
+  btnAutoTrack.textContent = st.tracking_enabled ? '🤖 Auto-Framing: ON' : '🤖 Auto-Framing: OFF';
+  btnAutoTrack.classList.toggle('active', !!st.tracking_enabled);
 
   const btnUk = document.getElementById('btnUkFilter');
-  btnUk.textContent = '🇬🇧 UK Filter: ' + (st.uk_filter_enabled !== false ? 'ON' : 'ALL 707');
-  btnUk.className = st.uk_filter_enabled !== false ? 'active' : '';
+  btnUk.textContent = st.uk_filter_enabled ? '🇬🇧 UK Filter: ON' : '🌍 UK Filter: OFF';
+  btnUk.classList.toggle('active', !!st.uk_filter_enabled);
 
-  const btnPrevBox = document.getElementById('btnPreviewBbox');
-  if (btnPrevBox) {
-    const prevOn = st.show_preview_bbox !== false;
-    btnPrevBox.textContent = '📦 Preview Box: ' + (prevOn ? 'ON' : 'OFF');
-    btnPrevBox.className = prevOn ? 'active' : '';
-  }
+  const btnPrev = document.getElementById('btnPreviewBbox');
+  btnPrev.textContent = '📦 Preview Box: ' + (st.show_preview_bbox ? 'ON' : 'OFF');
+  btnPrev.classList.toggle('active', !!st.show_preview_bbox);
 
-  const btnCapBox = document.getElementById('btnCaptureBbox');
-  if (btnCapBox) {
-    const capOn = st.show_capture_bbox !== false;
-    btnCapBox.textContent = '🖼️ Capture Box: ' + (capOn ? 'ON' : 'OFF');
-    btnCapBox.className = capOn ? 'active' : '';
-  }
+  const btnCap = document.getElementById('btnCaptureBbox');
+  btnCap.textContent = '🖼️ Capture Box: ' + (st.show_capture_bbox ? 'ON' : 'OFF');
+  btnCap.classList.toggle('active', !!st.show_capture_bbox);
 
   const fov = st.fov || 65;
-  const fovLbl = document.getElementById('fovLbl');
-  if (fovLbl) {
-    fovLbl.textContent = fov === 86 ? '86° Wide' : (fov === 78 ? '78° Medium' : '65° Narrow');
-  }
-  [86, 78, 65].forEach(deg => {
-    const b = document.getElementById('btnFov' + deg);
-    if (b) b.className = (fov === deg) ? 'active' : '';
-  });
+  document.getElementById('fovLbl').textContent = `${fov}° ${fov === 86 ? 'Wide' : fov === 78 ? 'Medium' : 'Narrow'}`;
+  document.getElementById('btnFov86').classList.toggle('active', fov === 86);
+  document.getElementById('btnFov78').classList.toggle('active', fov === 78);
+  document.getElementById('btnFov65').classList.toggle('active', fov === 65);
 
-  const afOn = st.autofocus !== false;
-  const focusVal = st.focus !== undefined ? st.focus : 50;
   const btnAf = document.getElementById('btnAutofocus');
-  if (btnAf) {
-    btnAf.textContent = 'AF: ' + (afOn ? 'ON' : 'MANUAL');
-    btnAf.className = afOn ? 'active' : '';
-  }
-  const focusSlider = document.getElementById('focusSlider');
-  if (focusSlider && document.activeElement !== focusSlider) {
-    focusSlider.value = focusVal;
-  }
-  const focusLbl = document.getElementById('focusLbl');
-  if (focusLbl) {
-    focusLbl.textContent = afOn ? `Auto (${focusVal})` : `Manual: ${focusVal}/100`;
-  }
+  btnAf.textContent = 'AF: ' + (st.autofocus ? 'ON' : 'OFF');
+  btnAf.classList.toggle('active', !!st.autofocus);
+  document.getElementById('focusLbl').textContent = st.autofocus ? 'Auto' : `Manual (${st.focus || 50})`;
+  const fSlider = document.getElementById('focusSlider');
+  if (document.activeElement !== fSlider && st.focus !== undefined) fSlider.value = st.focus;
 
   document.getElementById('btnInvPan').textContent = 'Invert Pan: ' + (st.invert_pan ? 'ON' : 'OFF');
+  document.getElementById('btnInvPan').classList.toggle('active', !!st.invert_pan);
   document.getElementById('btnInvTilt').textContent = 'Invert Tilt: ' + (st.invert_tilt ? 'ON' : 'OFF');
+  document.getElementById('btnInvTilt').classList.toggle('active', !!st.invert_tilt);
 
-  // Zone of Interest (ROI) button state
+  const ovBanner = document.getElementById('overrideBanner');
+  if (st.fsm_state === 'MANUAL_OVERRIDE' && (st.manual_override_remaining || 0) > 0) {
+    ovBanner.style.display = 'flex';
+    document.getElementById('overrideText').textContent = `Manual Override Active — Auto-Framing resumes in ${Math.round(st.manual_override_remaining)}s`;
+  } else {
+    ovBanner.style.display = 'none';
+  }
+
+  currentRoiState = st.roi;
+  const btnEditRoi = document.getElementById('btnEditRoi');
+  const btnClearRoi = document.getElementById('btnClearRoi');
   if (st.roi) {
-    currentRoiState = st.roi;
-    const btnClearRoi = document.getElementById('btnClearRoi');
-    const btnEditRoi = document.getElementById('btnEditRoi');
     if (!isEditingRoi) {
       if (st.roi.enabled) {
         btnEditRoi.textContent = '🎯 Zone: ON';
@@ -1279,7 +2010,7 @@ function updateUI(st) {
     }
   }
 
-  // Life List / Bird Dex
+  // Life List / Bird Dex (Requirement 3: trash can icon on each card)
   const dex = st.species_dex || [];
   document.getElementById('dexCountLbl').textContent = dex.length;
   let totalSightings = 0;
@@ -1293,23 +2024,28 @@ function updateUI(st) {
     dexGrid.innerHTML = dex.map(d => {
       const imgPath = d.best_thumb_filename || d.best_snapshot_filename;
       const imgHtml = imgPath
-        ? `<img src="/snapshots/${encodeURI(imgPath)}" alt="${d.species}" onclick="if(${d.best_sighting_id || 'null'}) openModalById(${d.best_sighting_id})">`
+        ? `<img src="/snapshots/${encodeURI(imgPath)}" alt="${escapeHtml(d.species)}" onclick="if(${d.best_sighting_id || 'null'}) openModalById(${d.best_sighting_id})">`
         : `<div style="aspect-ratio:4/3; background:#090d13; display:flex; align-items:center; justify-content:center; color:var(--muted); font-size:0.8rem;">No Photo</div>`;
       return `<div class="dex-card">
         ${imgHtml}
         <div class="dex-info">
           <div class="dex-title">
-            <span>${d.species}</span>
-            <span class="species-count-badge">${d.total_sightings}</span>
+            <span>${escapeHtml(d.species)}</span>
+            <div style="display:flex; align-items:center; gap:6px;">
+              <span class="species-count-badge">${d.total_sightings}</span>
+              <button class="dex-trash-btn" onclick="event.stopPropagation(); deleteDexSpecies('${escapeJs(d.species)}')" title="Delete all records for this species">
+                🗑️
+              </button>
+            </div>
           </div>
-          <div class="dex-sci">${d.scientific_name || ''}</div>
+          <div class="dex-sci">${escapeHtml(d.scientific_name || '')}</div>
           <div class="dex-meta">Peak Conf: ${((d.best_confidence || 0) * 100).toFixed(0)}% · Last: ${(d.last_seen || '').split(' ').pop()}</div>
         </div>
       </div>`;
     }).join('');
   }
 
-  // Recent Captures Gallery
+  // Recent Captures Gallery (Requirement 4: multi-select & batch override)
   if (Array.isArray(st.recent_snapshots)) {
     currentSightings = st.recent_snapshots;
     document.getElementById('snapCountLbl').textContent = currentSightings.length;
@@ -1320,15 +2056,18 @@ function updateUI(st) {
       gal.innerHTML = currentSightings.map(s => {
         const thumb = s.thumb_filename || s.snapshot_filename || s.filename;
         const confPct = (((s.species_confidence || s.yolo_confidence || 0)) * 100).toFixed(0);
-        return `<div class="snap-card" onclick="openModalById(${s.id})">
-          <img src="/snapshots/${encodeURI(thumb)}" alt="${s.species}">
+        const isSel = selectedCaptures.has(s.id);
+        return `<div class="snap-card ${isSel ? 'selected' : ''}" onclick="onSnapCardClick(event, ${s.id})">
+          <input type="checkbox" class="snap-select-cb" data-id="${s.id}" ${isSel ? 'checked' : ''} onclick="event.stopPropagation(); toggleCaptureSelected(${s.id}, this.checked)">
+          <img src="/snapshots/${encodeURI(thumb)}" alt="${escapeHtml(s.species)}">
           <div class="snap-card-caption">
-            <strong>${s.species || 'Bird'}</strong>
+            <strong>${escapeHtml(s.species || 'Bird')}</strong>
             <span style="color:var(--green-bright);">${confPct}%</span>
           </div>
         </div>`;
       }).join('');
     }
+    updateCapturesSelectionUI();
   }
 
   // Charts
@@ -1345,12 +2084,35 @@ function updateUI(st) {
   }
 }
 
+// Populate Species Dropdowns from /api/catalog
+fetch('/api/catalog')
+  .then(r => r.json())
+  .then(list => {
+    ukCatalog = list;
+    const relabelSel = document.getElementById('relabelSelect');
+    const batchSel = document.getElementById('batchSpeciesSelect');
+    if (relabelSel) {
+      relabelSel.innerHTML = list.map(item =>
+        `<option value="${item.common_name}">${item.common_name} (${item.scientific_name})</option>`
+      ).join('');
+    }
+    if (batchSel) {
+      batchSel.innerHTML = '<option value="">-- Choose New Species --</option>' +
+        list.map(item =>
+          `<option value="${item.common_name}">${item.common_name}</option>`
+        ).join('');
+    }
+  })
+  .catch(() => {});
+
 setInterval(async () => {
   try {
     const res = await fetch('/api/state');
     if (res.ok) updateUI(await res.json());
   } catch (e) {}
 }, 450);
+
+initLogsState();
 </script>
 </body>
 </html>
@@ -1363,15 +2125,16 @@ def draw_capture_bbox(
     species_name: str = "",
     confidence: float = 0.0,
 ) -> np.ndarray:
-    """Draw a clean bounding box and species label onto a saved bird snapshot."""
-    if frame is None or det is None:
+    """Draw a clean, elegant detection box and label badge on saved snapshot photo."""
+    if det is None:
         return frame
     out = frame.copy()
     h, w = out.shape[:2]
-    x1, y1 = int(det.xmin * w), int(det.ymin * h)
-    x2, y2 = int(det.xmax * w), int(det.ymax * h)
-    color = (67, 185, 46)
-    cv2.rectangle(out, (x1, y1), (x2, y2), color, 3)
+    x1, y1 = int(round(det.xmin * w)), int(round(det.ymin * h))
+    x2, y2 = int(round(det.xmax * w)), int(round(det.ymax * h))
+
+    color = (67, 185, 46)  # Green
+    cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
 
     label_text = species_name or det.display_name
     if species_name and confidence > 0.0:
@@ -1415,32 +2178,24 @@ def draw_overlay(
         rx2 = max(0, min(w, int(round(roi[2] * w))))
         ry2 = max(0, min(h, int(round(roi[3] * h))))
         if rx2 > rx1 and ry2 > ry1:
-            # Dim the outside of the Zone of Interest by 70%
             roi_patch = out[ry1:ry2, rx1:rx2].copy()
             out = (out.astype(np.float32) * 0.30).astype(np.uint8)
             out[ry1:ry2, rx1:rx2] = roi_patch
 
-            # Dual-stroke high-contrast border (outer black shadow 8px, inner Neon Yellow 3px)
             cv2.rectangle(out, (rx1, ry1), (rx2, ry2), (0, 0, 0), 8)
             cv2.rectangle(out, (rx1, ry1), (rx2, ry2), (0, 255, 255), 3)
 
-            # Neon Cyan corner brackets (BGR: 255, 255, 0, thickness 6)
             cyan_bgr = (255, 255, 0)
             bracket_len = max(18, int(min(rx2 - rx1, ry2 - ry1) * 0.15))
-            # NW
             cv2.line(out, (rx1, ry1), (rx1 + bracket_len, ry1), cyan_bgr, 6)
             cv2.line(out, (rx1, ry1), (rx1, ry1 + bracket_len), cyan_bgr, 6)
-            # NE
             cv2.line(out, (rx2, ry1), (rx2 - bracket_len, ry1), cyan_bgr, 6)
             cv2.line(out, (rx2, ry1), (rx2, ry1 + bracket_len), cyan_bgr, 6)
-            # SW
             cv2.line(out, (rx1, ry2), (rx1 + bracket_len, ry2), cyan_bgr, 6)
             cv2.line(out, (rx1, ry2), (rx1, ry2 - bracket_len), cyan_bgr, 6)
-            # SE
             cv2.line(out, (rx2, ry2), (rx2 - bracket_len, ry2), cyan_bgr, 6)
-            cv2.line(out, (rx2, ry2), (rx2, ry2 - bracket_len), cyan_bgr, 6)
+            cv2.line(out, (rx2, ry2), (rx2 - bracket_len, ry2), cyan_bgr, 6)
 
-            # High-contrast Neon Yellow badge with dark black text
             label_text = "ZONE OF INTEREST (ACTIVE)"
             font = cv2.FONT_HERSHEY_SIMPLEX
             font_scale = 0.52
@@ -1519,12 +2274,15 @@ class DashboardServer:
     on_control: Callable[[dict[str, Any]], None] | None = None
     on_snapshot_requested: Callable[[], dict[str, Any] | str | None] | None = None
     on_relabel_sighting: Callable[[int, str], bool] | None = None
+    on_batch_relabel: Callable[[list[int], str], int] | None = None
     on_delete_sighting: Callable[[int], bool] | None = None
+    on_delete_species: Callable[[str], int] | None = None
     get_catalog_cb: Callable[[], list[dict[str, str]]] | None = None
 
     _raw_frame: np.ndarray | None = field(default=None, init=False, repr=False)
     _jpeg_bytes: bytes = field(default=b"", init=False, repr=False)
     _clean_jpeg_bytes: bytes = field(default=b"", init=False, repr=False)
+    _offline_jpeg_bytes: bytes = field(default=b"", init=False, repr=False)
     _state: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
     _cond: threading.Condition = field(
         default_factory=threading.Condition, init=False, repr=False
@@ -1534,6 +2292,16 @@ class DashboardServer:
     def __post_init__(self) -> None:
         SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
         (SNAPSHOTS_DIR / "thumbs").mkdir(parents=True, exist_ok=True)
+        self._offline_jpeg_bytes = self._create_offline_frame()
+
+    def _create_offline_frame(self) -> bytes:
+        """Create a clean 960x540 black frame with centered 'Night mode \\nCamera Offline'."""
+        img = np.zeros((540, 960, 3), dtype=np.uint8)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cv2.putText(img, "Night mode", (370, 240), font, 1.25, (230, 230, 230), 2, cv2.LINE_AA)
+        cv2.putText(img, "Camera Offline", (330, 310), font, 1.25, (160, 160, 160), 2, cv2.LINE_AA)
+        ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        return buf.tobytes() if ok else b""
 
     def update_frame_and_state(
         self,
@@ -1547,6 +2315,12 @@ class DashboardServer:
         with self._cond:
             self._raw_frame = raw_bgr
             self._jpeg_bytes = buf.tobytes()
+            self._state = state
+            self._cond.notify_all()
+
+    def update_state_only(self, state: dict[str, Any]) -> None:
+        """Update telemetry/state when camera is sleeping in night mode without stalling threads."""
+        with self._cond:
             self._state = state
             self._cond.notify_all()
 
@@ -1598,8 +2372,21 @@ class DashboardServer:
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
+                elif path == "/popout":
+                    body = POPOUT_HTML.encode("utf-8")
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
                 elif path == "/api/state":
                     self._send_json(dashboard.get_state())
+                elif path == "/api/logs":
+                    qs = parse_qs(parsed.query)
+                    since_seq = int(qs.get("since", ["0"])[0])
+                    lvl = qs.get("level", [None])[0]
+                    entries = spotter_log.get_entries(min_level=lvl, since_seq=since_seq, limit=300)
+                    self._send_json({"level": spotter_log.level, "entries": entries})
                 elif path == "/api/catalog":
                     cat = dashboard.get_catalog_cb() if dashboard.get_catalog_cb else []
                     self._send_json(cat)
@@ -1633,8 +2420,11 @@ class DashboardServer:
                         last_sent = b""
                         while True:
                             with dashboard._cond:
-                                dashboard._cond.wait(timeout=1.0)
-                                if want_clean and dashboard._raw_frame is not None:
+                                dashboard._cond.wait(timeout=0.6)
+                                is_night = bool(dashboard._state.get("is_night_mode"))
+                                if is_night:
+                                    jpg = dashboard._offline_jpeg_bytes
+                                elif want_clean and dashboard._raw_frame is not None:
                                     ok, cbuf = cv2.imencode(
                                         ".jpg",
                                         dashboard._raw_frame,
@@ -1642,8 +2432,8 @@ class DashboardServer:
                                     )
                                     jpg = cbuf.tobytes() if ok else dashboard._jpeg_bytes
                                 else:
-                                    jpg = dashboard._jpeg_bytes
-                            if not jpg or jpg is last_sent:
+                                    jpg = dashboard._jpeg_bytes or dashboard._offline_jpeg_bytes
+                            if not jpg or (jpg is last_sent and not is_night):
                                 continue
                             last_sent = jpg
                             self.wfile.write(b"--frame\r\n")
@@ -1651,6 +2441,8 @@ class DashboardServer:
                             self.wfile.write(f"Content-Length: {len(jpg)}\r\n\r\n".encode())
                             self.wfile.write(jpg)
                             self.wfile.write(b"\r\n")
+                            if is_night:
+                                time.sleep(0.5)
                     except (BrokenPipeError, ConnectionResetError):
                         pass
                 else:
@@ -1687,6 +2479,16 @@ class DashboardServer:
                         else False
                     )
                     self._send_json({"success": ok})
+                elif self.path == "/api/sightings/batch_relabel":
+                    raw_ids = payload.get("ids", [])
+                    sids = [int(x) for x in raw_ids if str(x).isdigit() or isinstance(x, int)]
+                    new_sp = str(payload.get("species", "")).strip()
+                    count = (
+                        dashboard.on_batch_relabel(sids, new_sp)
+                        if (dashboard.on_batch_relabel and sids and new_sp)
+                        else 0
+                    )
+                    self._send_json({"success": count > 0, "count": count})
                 elif self.path == "/api/sighting/delete":
                     sid = int(payload.get("id", 0))
                     ok = (
@@ -1695,6 +2497,14 @@ class DashboardServer:
                         else False
                     )
                     self._send_json({"success": ok})
+                elif self.path == "/api/dex/delete":
+                    sp = str(payload.get("species", "")).strip()
+                    count = (
+                        dashboard.on_delete_species(sp)
+                        if (dashboard.on_delete_species and sp)
+                        else 0
+                    )
+                    self._send_json({"success": count > 0, "count": count})
                 else:
                     self.send_error(HTTPStatus.NOT_FOUND)
 

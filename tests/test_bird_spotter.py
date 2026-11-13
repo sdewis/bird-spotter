@@ -11,6 +11,7 @@ import numpy as np
 
 from bird_spotter.dashboard.server import draw_overlay
 from bird_spotter.db import BirdDatabase, compute_quality_score
+from bird_spotter.logger import spotter_log
 from bird_spotter.solar import SolarScheduler, calculate_solar_times_noaa
 from bird_spotter.vision.classifier import BirdSpeciesClassifier
 from bird_spotter.vision.detector import (
@@ -106,6 +107,84 @@ class TestBirdSpotter(unittest.TestCase):
             self.assertTrue(ok_del)
             self.assertFalse(snap1.exists())
             self.assertEqual(len(db.get_species_dex()), 0)
+
+            # 6. Unidentified Bird sightings are recorded but excluded from species_dex
+            rec_unid = db.record_sighting(
+                species="Unidentified Bird",
+                scientific_name="",
+                yolo_confidence=0.75,
+                species_confidence=0.18,
+                sharpness=85.0,
+                snapshot_filename="unid_1.jpg",
+                thumb_filename="unid_1.jpg",
+            )
+            self.assertEqual(rec_unid["species"], "Unidentified Bird")
+            self.assertEqual(len(db.get_species_dex()), 0)
+            self.assertEqual(db.get_total_sightings_count(), 1)
+            self.assertEqual(len(db.get_recent_sightings()), 1)
+
+            # 7. Batch relabel multiple sightings
+            snap_wt1 = tmp_path / "wt1.jpg"
+            snap_wt2 = tmp_path / "wt2.jpg"
+            snap_wt1.write_bytes(b"jpeg_data_wt1")
+            snap_wt2.write_bytes(b"jpeg_data_wt2")
+            s1 = db.record_sighting(
+                species="Willow Tit",
+                scientific_name="Poecile montanus",
+                yolo_confidence=0.8,
+                species_confidence=0.7,
+                sharpness=100.0,
+                snapshot_filename="wt1.jpg",
+            )
+            s2 = db.record_sighting(
+                species="Willow Tit",
+                scientific_name="Poecile montanus",
+                yolo_confidence=0.85,
+                species_confidence=0.75,
+                sharpness=110.0,
+                snapshot_filename="wt2.jpg",
+            )
+            self.assertEqual(len(db.get_species_dex()), 1)
+            self.assertEqual(db.get_species_dex()[0]["total_sightings"], 2)
+
+            batch_count = db.batch_relabel_sightings(
+                [s1["id"], s2["id"]], "Blue Tit", "Cyanistes caeruleus"
+            )
+            self.assertEqual(batch_count, 2)
+            dex = db.get_species_dex()
+            self.assertEqual(len(dex), 1)
+            self.assertEqual(dex[0]["species"], "Blue Tit")
+            self.assertEqual(dex[0]["total_sightings"], 2)
+
+            # 8. Delete species and verify all sightings + photo files removed
+            del_sp_count = db.delete_species("Blue Tit", snapshots_dir=tmp_path)
+            self.assertEqual(del_sp_count, 2)
+            self.assertFalse(snap_wt1.exists())
+            self.assertFalse(snap_wt2.exists())
+            self.assertEqual(len(db.get_species_dex()), 0)
+
+    def test_spotter_logger_levels_and_throttling(self) -> None:
+        spotter_log.clear()
+        spotter_log.set_level("INFO")
+        self.assertEqual(spotter_log.level, "INFO")
+
+        spotter_log.debug("TEST", "debug message 1")
+        spotter_log.info("TEST", "info message 1")
+        spotter_log.warn("TEST", "warning message 1")
+
+        info_entries = spotter_log.get_entries(min_level="INFO")
+        self.assertTrue(any(e["msg"] == "info message 1" for e in info_entries))
+        self.assertTrue(any(e["msg"] == "warning message 1" for e in info_entries))
+        self.assertFalse(any(e["msg"] == "debug message 1" for e in info_entries))
+
+        all_entries = spotter_log.get_entries(min_level="DEBUG")
+        self.assertTrue(any(e["msg"] == "debug message 1" for e in all_entries))
+
+        # Throttling test
+        e1 = spotter_log.debug_throttled("k1", "TEST", "throttled 1", interval_sec=1.0)
+        e2 = spotter_log.debug_throttled("k1", "TEST", "throttled 2", interval_sec=1.0)
+        self.assertIsNotNone(e1)
+        self.assertIsNone(e2)
 
     def test_uk_species_mask_filters_non_british_birds(self) -> None:
         clf = BirdSpeciesClassifier(uk_filter_enabled=True)
@@ -438,6 +517,83 @@ class TestBirdSpotter(unittest.TestCase):
         self.assertIn("dawn", status)
         self.assertIn("sunset", status)
         self.assertEqual(status["location"], "UK Test")
+
+    def test_dashboard_server_endpoints_and_night_mode(self) -> None:
+        """Test DashboardServer popout, state, batch relabel, dex delete, and night mode handling."""
+        import json
+        import urllib.request
+        from bird_spotter.dashboard.server import DashboardServer
+
+        batch_called = []
+        delete_species_called = []
+
+        def mock_batch_relabel(ids: list[int], sp: str) -> int:
+            batch_called.append((ids, sp))
+            return len(ids)
+
+        def mock_delete_species(sp: str) -> int:
+            delete_species_called.append(sp)
+            return 3
+
+        server = DashboardServer(
+            host="127.0.0.1",
+            port=18088,
+            on_batch_relabel=mock_batch_relabel,
+            on_delete_species=mock_delete_species,
+        )
+        server.start_background()
+        import time
+        time.sleep(0.1)
+
+        try:
+            # 1. Test /popout page
+            with urllib.request.urlopen("http://127.0.0.1:18088/popout", timeout=2.0) as resp:
+                self.assertEqual(resp.status, 200)
+                html = resp.read().decode("utf-8")
+                self.assertIn("Bird Spotter — Live Pop-out Feed", html)
+                self.assertIn("Night mode", html)
+
+            # 2. Test /api/state initial and update_state_only
+            server.update_state_only({"is_night_mode": True, "fps": 0.0, "system_power_on": False})
+            with urllib.request.urlopen("http://127.0.0.1:18088/api/state", timeout=2.0) as resp:
+                self.assertEqual(resp.status, 200)
+                st = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(st["is_night_mode"])
+                self.assertFalse(st["system_power_on"])
+
+            # 3. Test POST /api/sightings/batch_relabel
+            req_batch = urllib.request.Request(
+                "http://127.0.0.1:18088/api/sightings/batch_relabel",
+                data=json.dumps({"ids": [101, 102, 103], "species": "Blue Tit"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req_batch, timeout=2.0) as resp:
+                self.assertEqual(resp.status, 200)
+                res = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(res["success"])
+                self.assertEqual(res["count"], 3)
+            self.assertEqual(len(batch_called), 1)
+            self.assertEqual(batch_called[0], ([101, 102, 103], "Blue Tit"))
+
+            # 4. Test POST /api/dex/delete
+            req_del = urllib.request.Request(
+                "http://127.0.0.1:18088/api/dex/delete",
+                data=json.dumps({"species": "Magpie"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req_del, timeout=2.0) as resp:
+                self.assertEqual(resp.status, 200)
+                res = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(res["success"])
+                self.assertEqual(res["count"], 3)
+            self.assertEqual(len(delete_species_called), 1)
+            self.assertEqual(delete_species_called[0], "Magpie")
+
+        finally:
+            server.stop()
+
 
 
 

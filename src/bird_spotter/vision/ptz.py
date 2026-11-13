@@ -11,6 +11,7 @@ import time
 from typing import Any
 
 from bird_spotter.config import PROJECT_ROOT
+from bird_spotter.logger import spotter_log
 
 try:
     import obsbot_sdk
@@ -542,15 +543,25 @@ class ObsbotPTZ:
         if d_pan == 0 and d_tilt == 0:
             return False
 
-        return self.set_pan_tilt(self.pan + d_pan, self.tilt + d_tilt)
+        prev_pan, prev_tilt = self.pan, self.tilt
+        moved = self.set_pan_tilt(self.pan + d_pan, self.tilt + d_tilt)
+        if moved:
+            spotter_log.debug_throttled(
+                "ptz_track",
+                "PTZ",
+                f"Gimbal step: aim=({target_x:.2f},{target_y:.2f}) err=({err_x:+.2f},{err_y:+.2f}) -> "
+                f"pan {prev_pan}->{self.pan} ({self.pan - prev_pan:+d}), tilt {prev_tilt}->{self.tilt} ({self.tilt - prev_tilt:+d})",
+                interval_sec=0.35,
+            )
+        return moved
 
     def adjust_zoom_for_area(
         self,
         current_area_ratio: float,
-        target_min_area: float = 0.25,
-        target_max_area: float = 0.40,
+        target_min_area: float = 0.10,
+        target_max_area: float = 0.35,
     ) -> bool:
-        """Dynamically adjust zoom so the bird's bounding box occupies 25-40% of the frame."""
+        """Dynamically adjust zoom so the bird's bounding box occupies target_min_area..target_max_area of the frame."""
         if not self.tracking_enabled or not self.system_power_on:
             return False
         if current_area_ratio <= 0.001:
@@ -568,14 +579,33 @@ class ObsbotPTZ:
         if abs(delta) < 0.20:
             return False
 
-        return self.set_zoom(self.zoom + delta)
+        prev_zoom = self.zoom
+        moved = self.set_zoom(self.zoom + delta)
+        if moved:
+            spotter_log.debug_throttled(
+                "ptz_zoom",
+                "PTZ",
+                f"Zoom step: area={current_area_ratio * 100:.1f}% (target {target_min_area * 100:.0f}-{target_max_area * 100:.0f}%) -> "
+                f"zoom {prev_zoom:.2f}x -> {self.zoom:.2f}x",
+                interval_sec=0.35,
+            )
+        return moved
 
-    def auto_frame_detection(self, det) -> bool:
+    def auto_frame_detection(
+        self,
+        det,
+        target_min_area: float = 0.10,
+        target_max_area: float = 0.35,
+    ) -> bool:
         """Center bird in frame and adjust zoom dynamically once roughly centered."""
         if det is None:
             return False
         moved_pt = self.track_target(det.aim_x, det.aim_y)
         moved_zoom = False
         if abs(det.aim_x - 0.5) < 0.22 and abs(det.aim_y - 0.5) < 0.22:
-            moved_zoom = self.adjust_zoom_for_area(det.area_ratio)
+            moved_zoom = self.adjust_zoom_for_area(
+                det.area_ratio,
+                target_min_area=target_min_area,
+                target_max_area=target_max_area,
+            )
         return moved_pt or moved_zoom

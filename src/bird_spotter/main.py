@@ -20,6 +20,7 @@ from bird_spotter.dashboard.server import (
     draw_overlay,
 )
 from bird_spotter.db import BirdDatabase, compute_quality_score
+from bird_spotter.logger import spotter_log
 from bird_spotter.solar import SolarScheduler
 from bird_spotter.vision.classifier import BirdSpeciesClassifier
 from bird_spotter.vision.detector import (
@@ -38,6 +39,27 @@ from bird_spotter.vision.ptz import OBSBOT_CLI, ObsbotPTZ
 def _resolve_path(p: str | Path) -> Path:
     path = Path(p)
     return path if path.is_absolute() else (PROJECT_ROOT / path)
+
+
+def _find_camera_device(preferred: str = "/dev/video0") -> str:
+    """Find the OBSBOT Tiny SE or active UVC video device, falling back from preferred device."""
+    pref_path = Path(preferred)
+    if pref_path.exists():
+        return preferred
+    # Search /dev/v4l/by-id first for OBSBOT
+    by_id = Path("/dev/v4l/by-id")
+    if by_id.is_dir():
+        for p in sorted(by_id.glob("*OBSBOT*index0*")):
+            if p.exists():
+                return str(p.resolve())
+        for p in sorted(by_id.glob("*index0*")):
+            if p.exists():
+                return str(p.resolve())
+    # Next try /dev/video1, /dev/video0, etc.
+    for dev in ("/dev/video0", "/dev/video1", "/dev/video2"):
+        if Path(dev).exists():
+            return dev
+    return preferred
 
 
 def check_hardware(cfg: dict) -> int:
@@ -101,8 +123,11 @@ def run_spotter(cfg: dict, duration_sec: float | None = None) -> int:
     db_path = _resolve_path(spot_cfg.get("db_path", "data/bird_spotter.db"))
     db = BirdDatabase(db_path)
 
+    cam_dev = _find_camera_device(cam_cfg.get("device", "/dev/video0"))
+    cam_cfg["device"] = cam_dev
+
     ptz = ObsbotPTZ(
-        device=cam_cfg["device"],
+        device=cam_dev,
         pan_min=ptz_cfg.get("pan_min", -468000),
         pan_max=ptz_cfg.get("pan_max", 468000),
         pan_step=ptz_cfg.get("pan_step", 3600),
@@ -168,7 +193,8 @@ def run_spotter(cfg: dict, duration_sec: float | None = None) -> int:
     def on_burst_capture_ready(best: BurstCandidate, pred: Any) -> None:
         """Handle completed PTZ framing burst: evaluate species, save photo if new/better/cooldown, log to DB."""
         det = best.detection
-        if pred is not None:
+        min_clf_conf = float(cls_cfg.get("min_confidence", 0.25))
+        if pred is not None and pred.confidence >= min_clf_conf:
             species_name = pred.species
             sci_name = pred.scientific_name
             sp_conf = pred.confidence
@@ -177,14 +203,30 @@ def run_spotter(cfg: dict, duration_sec: float | None = None) -> int:
                 detector.tracker.assign_species(
                     det.track_id, species_name, sci_name, sp_conf, top_preds
                 )
+        elif pred is not None:
+            # Low confidence classifier prediction (< 25%)
+            species_name = "Unidentified Bird"
+            sci_name = ""
+            sp_conf = pred.confidence
+            top_preds = pred.top_predictions
+            spotter_log.info(
+                "CLASSIFIER",
+                f"Prediction below min_confidence ({pred.confidence:.1%} < {min_clf_conf:.1%}): "
+                f"top was {pred.species} ({pred.confidence:.1%}) -> recorded as 'Unidentified Bird'",
+            )
         else:
-            species_name = det.species or "Unidentified Bird"
-            sci_name = det.scientific_name or ""
-            sp_conf = det.species_confidence or det.confidence
+            if det.species and (det.species_confidence or 0.0) >= min_clf_conf:
+                species_name = det.species
+                sci_name = det.scientific_name or ""
+                sp_conf = det.species_confidence or det.confidence
+            else:
+                species_name = "Unidentified Bird"
+                sci_name = ""
+                sp_conf = det.species_confidence or det.confidence
             top_preds = det.top_predictions or []
 
         q_score = compute_quality_score(sp_conf, best.sharpness)
-        should_save, _reason = db.should_save_auto_photo(
+        should_save, reason = db.should_save_auto_photo(
             species=species_name,
             quality_score=q_score,
             per_species_cooldown_sec=per_species_cooldown,
@@ -205,7 +247,7 @@ def run_spotter(cfg: dict, duration_sec: float | None = None) -> int:
                 snapshots_dir=snapshots_dir,
             )
 
-        db.record_sighting(
+        rec = db.record_sighting(
             species=species_name,
             scientific_name=sci_name,
             yolo_confidence=det.confidence,
@@ -217,6 +259,13 @@ def run_spotter(cfg: dict, duration_sec: float | None = None) -> int:
             zoom_level=best.zoom,
             is_manual=False,
             top_predictions=top_preds,
+        )
+
+        photo_desc = f"photo saved: {snap_file} (reason: {reason})" if snap_file else f"no photo (reason: {reason})"
+        spotter_log.info(
+            "SPOTTED",
+            f"Sighting #{rec['id']}: {species_name} ({sp_conf:.1%}) | zoom={best.zoom:.1f}x, "
+            f"sharpness={best.sharpness:.1f}, Q={q_score:.3f} | {photo_desc}",
         )
 
     def handle_manual_snapshot() -> dict[str, Any]:
@@ -282,14 +331,25 @@ def run_spotter(cfg: dict, duration_sec: float | None = None) -> int:
         )
         return {"success": True, "filename": snap_file, "species": species_name, "sighting": rec}
 
+    manual_night_mode: bool | None = None
+
     def handle_control(cmd: dict[str, Any]) -> None:
-        nonlocal show_preview_bbox, show_capture_bbox
+        nonlocal show_preview_bbox, show_capture_bbox, manual_night_mode
         action = cmd.get("action")
         if action == "toggle_system_power":
             if ptz.system_power_on:
+                manual_night_mode = True
                 threading.Thread(target=ptz.standby_camera, daemon=True).start()
             else:
+                manual_night_mode = False
                 threading.Thread(target=ptz.wakeup_camera, daemon=True).start()
+        elif action == "activate_day_mode":
+            manual_night_mode = False
+            threading.Thread(target=ptz.wakeup_camera, daemon=True).start()
+            framer.resume_auto_tracking()
+        elif action == "activate_night_mode":
+            manual_night_mode = True
+            threading.Thread(target=ptz.standby_camera, daemon=True).start()
         elif action == "center":
             framer.trigger_manual_override()
             ptz.center()
@@ -358,6 +418,14 @@ def run_spotter(cfg: dict, duration_sec: float | None = None) -> int:
                     dashboard._state["solar"] = solar.get_status_dict()
         elif action == "clear_stats":
             db.clear_all()
+            spotter_log.warn("DATABASE", "Database cleared (sightings and species_dex wiped)")
+        elif action == "set_log_level":
+            new_lvl = spotter_log.set_level(str(cmd.get("level", "INFO")))
+            if dashboard is not None:
+                with dashboard._cond:
+                    dashboard._state["log_level"] = new_lvl
+        elif action == "clear_logs":
+            spotter_log.clear()
         elif action == "shutdown_pi":
             import subprocess
             threading.Thread(
@@ -369,8 +437,19 @@ def run_spotter(cfg: dict, duration_sec: float | None = None) -> int:
         sci_name = classifier.uk_name_to_sci.get(new_species, "")
         return db.relabel_sighting(sighting_id, new_species, scientific_name=sci_name)
 
+    def handle_batch_relabel(sighting_ids: list[int], new_species: str) -> int:
+        sci_name = classifier.uk_name_to_sci.get(new_species, "")
+        count = db.batch_relabel_sightings(sighting_ids, new_species, scientific_name=sci_name)
+        spotter_log.info("DATABASE", f"Batch re-labeled {count} sightings to '{new_species}'")
+        return count
+
     def handle_delete(sighting_id: int) -> bool:
         return db.delete_sighting(sighting_id, snapshots_dir=snapshots_dir)
+
+    def handle_delete_species(species: str) -> int:
+        count = db.delete_species(species, snapshots_dir=snapshots_dir)
+        spotter_log.info("DATABASE", f"Deleted all {count} records and photos for species '{species}'")
+        return count
 
     dashboard = DashboardServer(
         host=dash_cfg["host"],
@@ -378,7 +457,9 @@ def run_spotter(cfg: dict, duration_sec: float | None = None) -> int:
         on_control=handle_control,
         on_snapshot_requested=handle_manual_snapshot,
         on_relabel_sighting=handle_relabel,
+        on_batch_relabel=handle_batch_relabel,
         on_delete_sighting=handle_delete,
+        on_delete_species=handle_delete_species,
         get_catalog_cb=classifier.get_uk_species_catalog,
     )
     dashboard.start_background()
@@ -436,12 +517,95 @@ def run_spotter(cfg: dict, duration_sec: float | None = None) -> int:
                 if duration_sec is not None and (time.monotonic() - start_ts) >= duration_sec:
                     break
 
-                ok, frame = cap.read()
-                if not ok or frame is None:
-                    time.sleep(0.01)
+                now = time.monotonic()
+
+                # Refresh SQLite analytics every 0.8s so web dashboard stays updated at all times
+                if (now - last_db_poll_ts) >= 0.8:
+                    last_db_poll_ts = now
+                    cached_dex = db.get_species_dex()
+                    cached_stats = db.get_species_stats_dict()
+                    cached_snaps = db.get_recent_sightings(limit=24)
+                    cached_hourly = db.get_hourly_distribution()
+                    cached_daily = db.get_daily_trends()
+
+                # Evaluate solar sunset sleep / dawn wake schedule every ~5s
+                if (now - last_solar_check_ts) >= 5.0:
+                    last_solar_check_ts = now
+                    trans = solar.check_transition()
+                    if trans == "sleep" and ptz.system_power_on:
+                        print(
+                            "🌙 [Solar Scheduler] Entering night sleep window. Putting camera into standby."
+                        )
+                        manual_night_mode = True
+                        threading.Thread(target=ptz.standby_camera, daemon=True).start()
+                    elif trans == "wake" and not ptz.system_power_on:
+                        print(
+                            "🌅 [Solar Scheduler] Entering dawn wake window. Waking up camera."
+                        )
+                        manual_night_mode = False
+                        threading.Thread(target=ptz.wakeup_camera, daemon=True).start()
+
+                if manual_night_mode is True:
+                    is_night = True
+                elif manual_night_mode is False:
+                    is_night = False
+                else:
+                    is_night = bool(solar.is_night_sleep_window() or not ptz.system_power_on)
+
+                if not ptz.system_power_on or is_night:
+                    # Camera is offline / in standby / night mode.
+                    # Keep web dashboard responsive and state fresh without hammering V4L2.
+                    offline_state = {
+                        "fps": 0.0,
+                        "infer_ms": 0.0,
+                        "resolution": f"{cam_cfg.get('width', 1920)}x{cam_cfg.get('height', 1080)}",
+                        "zoom": round(ptz.zoom, 2),
+                        "fov": ptz.fov,
+                        "autofocus": ptz.autofocus,
+                        "focus": ptz.focus,
+                        "roi": ptz.get_roi_dict(),
+                        "detections_count": 0,
+                        "primary_target": None,
+                        "primary_area": 0.0,
+                        "pan": ptz.pan,
+                        "tilt": ptz.tilt,
+                        "home_preset": {
+                            "pan": ptz.home_pan,
+                            "tilt": ptz.home_tilt,
+                            "zoom": ptz.home_zoom,
+                            "fov": ptz.home_fov,
+                            "autofocus": ptz.home_autofocus,
+                            "focus": ptz.home_focus,
+                        },
+                        "system_power_on": ptz.system_power_on,
+                        "tracking_enabled": ptz.tracking_enabled,
+                        "fsm_state": "NIGHT_SLEEP" if is_night else "STANDBY",
+                        "fsm_label": "NIGHT MODE (CAMERA OFFLINE)" if is_night else "CAMERA STANDBY",
+                        "manual_override_remaining": 0.0,
+                        "invert_pan": ptz.invert_pan,
+                        "invert_tilt": ptz.invert_tilt,
+                        "show_preview_bbox": show_preview_bbox,
+                        "show_capture_bbox": show_capture_bbox,
+                        "uk_filter_enabled": classifier.uk_filter_enabled,
+                        "classifier_backend": classifier.active_backend,
+                        "species_dex": cached_dex,
+                        "species_stats": cached_stats,
+                        "recent_snapshots": cached_snaps,
+                        "hourly_distribution": cached_hourly,
+                        "daily_trends": cached_daily,
+                        "solar": solar.get_status_dict(),
+                        "log_level": spotter_log.level,
+                        "is_night_mode": is_night,
+                    }
+                    dashboard.update_state_only(offline_state)
+                    time.sleep(0.25)
                     continue
 
-                now = time.monotonic()
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    time.sleep(0.02)
+                    continue
+
                 dt = max(1e-4, now - prev_ts)
                 prev_ts = now
                 inst_fps = 1.0 / dt
@@ -465,30 +629,6 @@ def run_spotter(cfg: dict, duration_sec: float | None = None) -> int:
                     on_capture_ready=on_burst_capture_ready,
                     now=now,
                 )
-
-                # Refresh SQLite analytics every 0.8s so frame loop stays >25 FPS
-                if (now - last_db_poll_ts) >= 0.8:
-                    last_db_poll_ts = now
-                    cached_dex = db.get_species_dex()
-                    cached_stats = db.get_species_stats_dict()
-                    cached_snaps = db.get_recent_sightings(limit=24)
-                    cached_hourly = db.get_hourly_distribution()
-                    cached_daily = db.get_daily_trends()
-
-                # Evaluate solar sunset sleep / dawn wake schedule every ~5s
-                if (now - last_solar_check_ts) >= 5.0:
-                    last_solar_check_ts = now
-                    trans = solar.check_transition()
-                    if trans == "sleep" and ptz.system_power_on:
-                        print(
-                            "🌙 [Solar Scheduler] Entering night sleep window. Putting camera into standby."
-                        )
-                        threading.Thread(target=ptz.standby_camera, daemon=True).start()
-                    elif trans == "wake" and not ptz.system_power_on:
-                        print(
-                            "🌅 [Solar Scheduler] Entering dawn wake window. Waking up camera."
-                        )
-                        threading.Thread(target=ptz.wakeup_camera, daemon=True).start()
 
                 annotated = draw_overlay(
                     frame=frame,
@@ -546,6 +686,8 @@ def run_spotter(cfg: dict, duration_sec: float | None = None) -> int:
                     "hourly_distribution": cached_hourly,
                     "daily_trends": cached_daily,
                     "solar": solar.get_status_dict(),
+                    "log_level": spotter_log.level,
+                    "is_night_mode": False,
                 }
                 dashboard.update_frame_and_state(frame, annotated, state)
     finally:
