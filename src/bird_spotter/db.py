@@ -550,6 +550,36 @@ class BirdDatabase:
                 out.append(d)
             return out
 
+    def get_sightings_for_species(
+        self, species: str, limit: int = 150, photos_only: bool = False
+    ) -> list[dict[str, Any]]:
+        """Return recorded sightings for a given species, prioritizing captures with photos."""
+        with self._lock, self._connect() as conn:
+            where_sql = "WHERE species = ?"
+            if photos_only:
+                where_sql += " AND snapshot_filename IS NOT NULL AND snapshot_filename != ''"
+            rows = conn.execute(
+                f"""
+                SELECT * FROM sightings
+                {where_sql}
+                ORDER BY CASE WHEN snapshot_filename IS NOT NULL AND snapshot_filename != '' THEN 0 ELSE 1 END,
+                         id DESC
+                LIMIT ?
+                """,
+                (str(species), int(limit)),
+            ).fetchall()
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                d = dict(r)
+                try:
+                    d["top_predictions"] = json.loads(d.pop("top_predictions_json", "[]"))
+                except Exception:
+                    d["top_predictions"] = []
+                d["filename"] = d["snapshot_filename"]
+                d["time"] = d["timestamp"].split(" ")[-1] if " " in d["timestamp"] else d["timestamp"]
+                out.append(d)
+            return out
+
     def get_hourly_distribution(self, days: int = 30) -> list[int]:
         """Return 24-bin list of sightings per hour of day [00..23] over the past N days."""
         cutoff = (datetime.now() - timedelta(days=days)).timestamp()

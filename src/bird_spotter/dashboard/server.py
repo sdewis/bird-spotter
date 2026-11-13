@@ -547,11 +547,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     display: flex;
     flex-direction: column;
     position: relative;
-    transition: transform 0.15s, border-color 0.15s;
+    cursor: pointer;
+    user-select: none;
+    transition: transform 0.15s, border-color 0.15s, box-shadow 0.15s;
   }
   .dex-card:hover {
     border-color: #58a6ff;
     transform: translateY(-2px);
+    box-shadow: 0 4px 14px rgba(88, 166, 255, 0.22);
   }
   .dex-card img {
     width: 100%;
@@ -1165,8 +1168,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <div id="reviewModal" class="modal-backdrop" onclick="if(event.target===this) closeModal()">
   <div class="modal-box">
     <div class="card-header">
-      <span id="modalTitle">Sighting Inspection</span>
-      <div style="display:flex; align-items:center; gap:8px;">
+      <div style="display:flex; align-items:center; gap:8px; overflow:hidden;">
+        <span id="modalTitle" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">Sighting Inspection</span>
+      </div>
+      <div style="display:flex; align-items:center; gap:8px; flex-shrink:0;">
+        <div id="modalNavControls" style="display:flex; align-items:center; gap:4px; margin-right:4px;">
+          <button id="btnModalPrev" class="btn-subtle" onclick="navigateModal(-1)" title="Previous entry (ArrowLeft)" style="padding:3px 8px; font-size:0.75rem;">◀ Prev</button>
+          <span id="modalCounter" style="font-size:0.75rem; color:var(--text-bright); font-weight:700; min-width:65px; text-align:center;">1 / 1</span>
+          <button id="btnModalNext" class="btn-subtle" onclick="navigateModal(1)" title="Next entry (ArrowRight)" style="padding:3px 8px; font-size:0.75rem;">Next ▶</button>
+        </div>
         <span id="modalZoomVal" style="font-size:0.75rem; color:var(--muted); font-weight:700;">1.0x</span>
         <button class="btn-subtle" onclick="resetModalZoom(event)">Reset Zoom</button>
         <button onclick="closeModal()" style="padding:4px 10px;">✕ Close</button>
@@ -1856,21 +1866,78 @@ function clampModalPan() {
   });
 })();
 
+let modalItemList = [];
+let modalItemIndex = 0;
+let modalContextTitle = '';
+
+async function openDexSpecies(species) {
+  try {
+    const res = await fetch('/api/dex/sightings?species=' + encodeURIComponent(species));
+    if (!res.ok) throw new Error('API error');
+    const data = await res.json();
+    const sightings = data.sightings || [];
+    if (sightings.length === 0) {
+      showToast('No sighting records found for ' + species);
+      return;
+    }
+    modalItemList = sightings;
+    modalItemIndex = 0;
+    modalContextTitle = species;
+    displayModalItemAtIndex(0);
+  } catch (err) {
+    showToast('Failed to load sightings for ' + species);
+  }
+}
+
 function openModalById(id) {
-  const item = currentSightings.find(s => s.id === id);
+  modalItemList = Array.isArray(currentSightings) ? currentSightings : [];
+  const idx = modalItemList.findIndex(s => s.id === id);
+  modalItemIndex = idx >= 0 ? idx : 0;
+  modalContextTitle = 'Captures';
+  displayModalItemAtIndex(modalItemIndex);
+}
+
+function navigateModal(delta) {
+  if (!modalItemList || modalItemList.length === 0) return;
+  modalItemIndex = (modalItemIndex + delta + modalItemList.length) % modalItemList.length;
+  displayModalItemAtIndex(modalItemIndex);
+}
+
+function displayModalItemAtIndex(idx) {
+  if (!modalItemList || modalItemList.length === 0) return;
+  const item = modalItemList[idx];
   if (!item) return;
+
   selectedSightingId = item.id;
   resetModalZoom();
 
-  document.getElementById('modalTitle').textContent = `#${item.id} — ${item.species} (${((item.species_confidence || item.yolo_confidence || 0) * 100).toFixed(0)}%)`;
+  const titlePrefix = modalContextTitle && modalContextTitle !== item.species ? `[${modalContextTitle}] ` : '';
+  const confPct = ((item.species_confidence || item.yolo_confidence || 0) * 100).toFixed(0);
+  document.getElementById('modalTitle').textContent = `${titlePrefix}#${item.id} — ${item.species} (${confPct}%)`;
+
+  const counterEl = document.getElementById('modalCounter');
+  if (counterEl) {
+    counterEl.textContent = `${idx + 1} / ${modalItemList.length}`;
+  }
+  const btnPrev = document.getElementById('btnModalPrev');
+  const btnNext = document.getElementById('btnModalNext');
+  if (btnPrev) btnPrev.disabled = (modalItemList.length <= 1);
+  if (btnNext) btnNext.disabled = (modalItemList.length <= 1);
+
   const snapSrc = item.snapshot_filename || item.thumb_filename || '';
   const mImg = document.getElementById('modalImg');
-  mImg.src = snapSrc ? ('/snapshots/' + encodeURI(snapSrc)) : '';
-  mImg.onerror = function() {
-    if (item.thumb_filename && mImg.src.indexOf(encodeURI(item.thumb_filename)) === -1) {
-      mImg.src = '/snapshots/' + encodeURI(item.thumb_filename);
-    }
-  };
+  if (snapSrc) {
+    mImg.style.display = 'block';
+    mImg.src = '/snapshots/' + encodeURI(snapSrc);
+    mImg.onerror = function() {
+      if (item.thumb_filename && mImg.src.indexOf(encodeURI(item.thumb_filename)) === -1) {
+        mImg.src = '/snapshots/' + encodeURI(item.thumb_filename);
+      }
+    };
+  } else {
+    mImg.style.display = 'none';
+  }
+
   document.getElementById('modalMeta').innerHTML =
     `<strong>Timestamp:</strong> ${item.timestamp || 'N/A'} &nbsp;|&nbsp; ` +
     `<strong>Scientific:</strong> <em>${item.scientific_name || 'N/A'}</em> &nbsp;|&nbsp; ` +
@@ -1896,6 +1963,9 @@ function closeModal() {
   document.getElementById('reviewModal').classList.remove('open');
   resetModalZoom();
   selectedSightingId = null;
+  modalItemList = [];
+  modalItemIndex = 0;
+  modalContextTitle = '';
 }
 
 async function submitRelabel() {
@@ -1908,7 +1978,10 @@ async function submitRelabel() {
   });
   if (res.ok) {
     showToast('Re-labeled sighting to ' + newSp);
-    closeModal();
+    if (modalItemList && modalItemList[modalItemIndex]) {
+      modalItemList[modalItemIndex].species = newSp;
+      displayModalItemAtIndex(modalItemIndex);
+    }
     const sRes = await fetch('/api/state');
     if (sRes.ok) updateUI(await sRes.json());
   }
@@ -1917,18 +1990,44 @@ async function submitRelabel() {
 async function submitDelete() {
   if (!selectedSightingId) return;
   if (!confirm('Delete this sighting and remove its snapshot from disk?')) return;
+  const delId = selectedSightingId;
   const res = await fetch('/api/sighting/delete', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ id: selectedSightingId })
+    body: JSON.stringify({ id: delId })
   });
   if (res.ok) {
-    showToast('Deleted sighting #' + selectedSightingId);
-    closeModal();
+    showToast('Deleted sighting #' + delId);
+    if (modalItemList && modalItemList.length > 0) {
+      modalItemList.splice(modalItemIndex, 1);
+      if (modalItemList.length === 0) {
+        closeModal();
+      } else {
+        if (modalItemIndex >= modalItemList.length) modalItemIndex = modalItemList.length - 1;
+        displayModalItemAtIndex(modalItemIndex);
+      }
+    } else {
+      closeModal();
+    }
     const sRes = await fetch('/api/state');
     if (sRes.ok) updateUI(await sRes.json());
   }
 }
+
+window.addEventListener('keydown', (e) => {
+  const modal = document.getElementById('reviewModal');
+  if (!modal || !modal.classList.contains('open')) return;
+  if (e.target && (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT')) return;
+  if (e.key === 'ArrowLeft') {
+    e.preventDefault();
+    navigateModal(-1);
+  } else if (e.key === 'ArrowRight') {
+    e.preventDefault();
+    navigateModal(1);
+  } else if (e.key === 'Escape') {
+    closeModal();
+  }
+});
 
 function renderBars(containerId, values, labels) {
   const el = document.getElementById(containerId);
@@ -2118,9 +2217,9 @@ function updateUI(st) {
     dexGrid.innerHTML = dex.map(d => {
       const imgPath = d.best_thumb_filename || d.best_snapshot_filename;
       const imgHtml = imgPath
-        ? `<img src="/snapshots/${encodeURI(imgPath)}" alt="${escapeHtml(d.species)}" onerror="this.style.display='none'; if(this.nextElementSibling) this.nextElementSibling.style.display='flex';" onclick="if(${d.best_sighting_id || 'null'}) openModalById(${d.best_sighting_id})"><div style="display:none; aspect-ratio:4/3; background:#090d13; align-items:center; justify-content:center; color:var(--muted); font-size:0.8rem;">No Photo</div>`
+        ? `<img src="/snapshots/${encodeURI(imgPath)}" alt="${escapeHtml(d.species)}" onerror="this.style.display='none'; if(this.nextElementSibling) this.nextElementSibling.style.display='flex';"><div style="display:none; aspect-ratio:4/3; background:#090d13; align-items:center; justify-content:center; color:var(--muted); font-size:0.8rem;">No Photo</div>`
         : `<div style="aspect-ratio:4/3; background:#090d13; display:flex; align-items:center; justify-content:center; color:var(--muted); font-size:0.8rem;">No Photo</div>`;
-      return `<div class="dex-card">
+      return `<div class="dex-card" onclick="openDexSpecies('${escapeJs(d.species)}')">
         ${imgHtml}
         <div class="dex-info">
           <div class="dex-title">
@@ -2377,6 +2476,7 @@ class DashboardServer:
     on_batch_relabel: Callable[[list[int], str], int] | None = None
     on_delete_sighting: Callable[[int], bool] | None = None
     on_delete_species: Callable[[str], int] | None = None
+    on_get_species_sightings: Callable[[str], list[dict[str, Any]]] | None = None
     get_catalog_cb: Callable[[], list[dict[str, str]]] | None = None
     snapshots_dir: Path = field(default_factory=lambda: SNAPSHOTS_DIR)
 
@@ -2548,6 +2648,15 @@ class DashboardServer:
                 elif path == "/api/catalog":
                     cat = dashboard.get_catalog_cb() if dashboard.get_catalog_cb else []
                     self._send_json(cat)
+                elif path == "/api/dex/sightings":
+                    qs = parse_qs(parsed.query)
+                    sp = qs.get("species", [""])[0].strip()
+                    items = (
+                        dashboard.on_get_species_sightings(sp)
+                        if (dashboard.on_get_species_sightings and sp)
+                        else []
+                    )
+                    self._send_json({"species": sp, "sightings": items})
                 elif path.startswith("/snapshots/"):
                     rel_str = unquote(path[len("/snapshots/"):]).lstrip("/")
                     found = dashboard._find_snapshot_file(rel_str)

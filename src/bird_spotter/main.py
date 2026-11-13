@@ -461,6 +461,7 @@ def run_spotter(cfg: dict, duration_sec: float | None = None) -> int:
         on_batch_relabel=handle_batch_relabel,
         on_delete_sighting=handle_delete,
         on_delete_species=handle_delete_species,
+        on_get_species_sightings=lambda sp: db.get_sightings_for_species(sp),
         get_catalog_cb=classifier.get_uk_species_catalog,
     )
     dashboard.start_background()

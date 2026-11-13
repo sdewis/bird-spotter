@@ -540,6 +540,7 @@ class TestBirdSpotter(unittest.TestCase):
             port=18088,
             on_batch_relabel=mock_batch_relabel,
             on_delete_species=mock_delete_species,
+            on_get_species_sightings=lambda sp: [{"id": 99, "species": sp}],
         )
         server.start_background()
         import time
@@ -590,6 +591,14 @@ class TestBirdSpotter(unittest.TestCase):
                 self.assertEqual(res["count"], 3)
             self.assertEqual(len(delete_species_called), 1)
             self.assertEqual(delete_species_called[0], "Magpie")
+
+            # 5. Test GET /api/dex/sightings
+            with urllib.request.urlopen("http://127.0.0.1:18088/api/dex/sightings?species=Robin", timeout=2.0) as resp:
+                self.assertEqual(resp.status, 200)
+                res = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(res["species"], "Robin")
+                self.assertEqual(len(res["sightings"]), 1)
+                self.assertEqual(res["sightings"][0]["id"], 99)
 
         finally:
             server.stop()
