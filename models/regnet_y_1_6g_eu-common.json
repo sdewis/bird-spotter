@@ -1,0 +1,47 @@
+{
+  "birder_version": "v0.0.6a24",
+  "name": "regnet",
+  "alias": "regnet_y_1_6g",
+  "task": "image_classification",
+  "net_param": null,
+  "model_config": {
+    "depth": 27,
+    "w_0": 48,
+    "w_a": 20.71,
+    "w_m": 2.65,
+    "group_width": 24,
+    "se_ratio": 0.25
+  },
+  "signature": {
+    "inputs": [
+      {
+        "data_shape": [
+          0,
+          3,
+          256,
+          256
+        ]
+      }
+    ],
+    "outputs": [
+      {
+        "data_shape": [
+          0,
+          707
+        ]
+      }
+    ]
+  },
+  "rgb_stats": {
+    "mean": [
+      0.5248,
+      0.5372,
+      0.5086
+    ],
+    "std": [
+      0.2135,
+      0.2103,
+      0.2622
+    ]
+  }
+}

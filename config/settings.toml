@@ -1,7 +1,7 @@
 [camera]
 device = "/dev/video0"
-width = 1280
-height = 720
+width = 1920
+height = 1080
 fps = 30
 format = "MJPG"
 
@@ -19,43 +19,60 @@ kp_pan = 45000.0
 kp_tilt = 35000.0
 invert_pan = true
 invert_tilt = true
+default_zoom = 1.0
+zoom_min = 1.0
+zoom_max = 4.0
+zoom_step = 0.25
+home_pan = 0
+home_tilt = 0
+home_zoom = 1.0
+home_fov = 65
+autofocus = true
+focus = 50
 
 [hailo]
 hef_path = "/usr/share/hailo-models/yolov8s_h8.hef"
-score_threshold = 0.62
+score_threshold = 0.35
 iou_threshold = 0.45
 target_classes = [
-    "person", "upper body", "frontal face", "side face"
+    "bird"
 ]
 
-[pi2_servos]
-enabled = true
-host = "192.168.100.125"
-port = 5555
-ssh_user = "sean"
-pan_channel = 0
-tilt_channel = 1
-jaw_channel = 2
-eyes_channel = 3
-pan_center = 90
-tilt_center = 90
+[classifier]
+hef_path = "models/uk_birds_regnet_y_1_6g_h8.hef"
+onnx_path = "models/uk_birds_regnet_y_1_6g.onnx"
+labels_path = "models/eu_common_labels.json"
+uk_birds_path = "config/uk_birds.json"
+uk_filter_enabled = true
+min_confidence = 0.25
 
-[personality]
-# Bipolar state triggers
-looming_bbox_area_ratio = 0.22
-crowd_threshold = 2
-mood_swing_interval_sec = 45.0
-sweet_classes = ["cat", "dog", "bird"]
-
-[audio]
-enabled = true
-auto_speak = true
-cooldown_sec = 30.0
-pi2_alsa_device = "plughw:CARD=Headphones,DEV=0"
-volume_percent = 95
-jaw_closed_deg = 85
-jaw_open_deg = 135
+[spotter]
+auto_framing = true
+auto_snapshot = true
+show_preview_bbox = true
+show_capture_bbox = true
+target_min_area = 0.25
+target_max_area = 0.40
+settle_delay_sec = 0.35
+burst_count = 5
+max_framing_sec = 7.5
+lost_timeout_sec = 1.8
+return_home_settle_sec = 2.2
+manual_pause_sec = 60.0
+per_species_cooldown_sec = 300.0
+snapshots_dir = "snapshots"
+db_path = "data/bird_spotter.db"
+confidence_threshold = 0.50
 
 [dashboard]
 host = "0.0.0.0"
 port = 8080
+
+[solar]
+enabled = true
+auto_location = true
+latitude = 52.3555
+longitude = -1.1743
+wake_before_dawn_min = 30
+sleep_after_sunset_min = 30
+

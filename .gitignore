@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
 
 # Virtual environments
 .venv/
@@ -17,15 +18,21 @@ dist/
 .env
 config/local.toml
 
-# Runtime artifacts & recordings
+# Runtime artifacts, databases & captures (managed on Pi 5)
+data/
+snapshots/
 logs/
 recordings/
 hailort.log
+gstshark_*/
+backups/
+
+# Large model weights (keep small .json label/metadata files tracked)
+models/*.onnx
+models/*.pt
+models/*.pth
+models/*.hef
 models/piper/
-backups/*.tar.gz
-*.wav
-*.mp3
-!assets/audio/*.wav
 
 # IDE / OS
 .vscode/

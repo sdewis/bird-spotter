@@ -3,18 +3,26 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "halloween"
+name = "bird-spotter"
 version = "0.1.0"
-description = "Interactive bipolar animatronic skull powered by RPi5 + Hailo-8, OBSBOT Tiny SE PTZ, and RPi2 Picon Zero servos."
+description = "British Bird Spotter & Tracker powered by RPi5 + Hailo-8, OBSBOT Tiny SE PTZ, and web dashboard."
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [
     { name = "Sean" }
 ]
-dependencies = []
+dependencies = [
+    "numpy",
+    "opencv-python-headless",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
 
 [project.scripts]
-halloween = "halloween.main:main"
+bird-spotter = "bird_spotter.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
