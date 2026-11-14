@@ -152,11 +152,17 @@ def extract_bird_crop(
 
 
 def compute_crop_sharpness(bgr_crop: np.ndarray) -> float:
-    """Compute Laplacian variance sharpness metric on a BGR crop."""
+    """Compute noise-robust Laplacian variance sharpness metric on a BGR crop.
+
+    Applies gentle Gaussian filtering (sigma=0.6) before Laplacian variance to
+    suppress digital-zoom interpolation noise and ISP edge ringing, ensuring
+    true optical subject focus is prioritized over sensor grain.
+    """
     if bgr_crop is None or bgr_crop.size == 0:
         return 0.0
     gray = cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2GRAY)
-    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    filtered = cv2.GaussianBlur(gray, (3, 3), 0.6)
+    return float(cv2.Laplacian(filtered, cv2.CV_64F).var())
 
 
 def filter_detections_by_roi(

@@ -21,7 +21,7 @@ invert_pan = true
 invert_tilt = true
 default_zoom = 1.0
 zoom_min = 1.0
-zoom_max = 4.0
+zoom_max = 1.8
 zoom_step = 0.25
 home_pan = 0
 home_tilt = 0
@@ -29,6 +29,7 @@ home_zoom = 1.0
 home_fov = 65
 autofocus = true
 focus = 50
+sharpness = 45
 
 [hailo]
 hef_path = "/usr/share/hailo-models/yolov8s_h8.hef"
@@ -51,8 +52,8 @@ auto_framing = true
 auto_snapshot = true
 show_preview_bbox = true
 show_capture_bbox = true
-target_min_area = 0.10
-target_max_area = 0.35
+target_min_area = 0.03
+target_max_area = 0.12
 settle_delay_sec = 0.30
 burst_count = 5
 max_framing_sec = 4.0
@@ -63,6 +64,10 @@ per_species_cooldown_sec = 300.0
 snapshots_dir = "snapshots"
 db_path = "data/bird_spotter.db"
 confidence_threshold = 0.50
+super_resolution = true
+sr_model = "fsrcnn"
+sr_scale = 4
+burst_stacking = true
 
 [dashboard]
 host = "0.0.0.0"

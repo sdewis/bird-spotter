@@ -33,6 +33,7 @@ from bird_spotter.vision.framing import (
     BurstCandidate,
     save_clean_snapshot_and_thumb,
 )
+from bird_spotter.vision.enhancer import SuperResolutionEnhancer
 from bird_spotter.vision.ptz import OBSBOT_CLI, ObsbotPTZ
 
 
@@ -93,6 +94,9 @@ def check_hardware(cfg: dict) -> int:
         f"  Collins Bird Guide Labels ({cls_labels.name}): "
         f"{'OK' if cls_labels.is_file() else 'MISSING'}"
     )
+    sr_test = SuperResolutionEnhancer(models_dir=PROJECT_ROOT / "models")
+    sr_desc = f"{sr_test._active_model.upper()} x{sr_test._active_scale}" if sr_test.is_ai_active else "LANCZOS-4 FALLBACK"
+    print(f"  AI Super-Resolution: {'OK (' + sr_desc + ')' if sr_test.is_ai_active else 'FALLBACK (Lanczos-4)'}")
     print(f"  OBSBOT CLI Tool ({OBSBOT_CLI}): {'OK' if cli_ok else 'MISSING'}")
     print(f"  Web Dashboard Target: http://{dash_cfg['host']}:{dash_cfg['port']}")
 
@@ -142,7 +146,7 @@ def run_spotter(cfg: dict, duration_sec: float | None = None) -> int:
         tracking_enabled=ptz_cfg.get("enabled", True),
         zoom=ptz_cfg.get("default_zoom", 1.0),
         zoom_min=ptz_cfg.get("zoom_min", 1.0),
-        zoom_max=ptz_cfg.get("zoom_max", 4.0),
+        zoom_max=ptz_cfg.get("zoom_max", 1.8),
         zoom_step=ptz_cfg.get("zoom_step", 0.25),
         home_pan=ptz_cfg.get("home_pan", 0),
         home_tilt=ptz_cfg.get("home_tilt", 0),
@@ -150,8 +154,16 @@ def run_spotter(cfg: dict, duration_sec: float | None = None) -> int:
         home_fov=ptz_cfg.get("home_fov", 65),
         home_autofocus=ptz_cfg.get("autofocus", True),
         home_focus=ptz_cfg.get("focus", 50),
+        hardware_sharpness=ptz_cfg.get("sharpness", 45),
     )
     ptz.return_to_home()
+
+    enhancer = SuperResolutionEnhancer(
+        model_name=spot_cfg.get("sr_model", "fsrcnn"),
+        scale=int(spot_cfg.get("sr_scale", 4)),
+        models_dir=_resolve_path("models"),
+        enable_ai=bool(spot_cfg.get("super_resolution", True)),
+    )
 
     classifier = BirdSpeciesClassifier(
         hef_path=_resolve_path(cls_cfg.get("hef_path", "models/uk_birds_regnet_y_1_6g_h8.hef")),
@@ -171,14 +183,16 @@ def run_spotter(cfg: dict, duration_sec: float | None = None) -> int:
 
     framer = AutoFrameController(
         ptz=ptz,
-        target_min_area=spot_cfg.get("target_min_area", 0.25),
-        target_max_area=spot_cfg.get("target_max_area", 0.40),
+        target_min_area=spot_cfg.get("target_min_area", 0.03),
+        target_max_area=spot_cfg.get("target_max_area", 0.12),
         settle_delay_sec=spot_cfg.get("settle_delay_sec", 0.35),
         burst_count=spot_cfg.get("burst_count", 5),
-        max_framing_sec=spot_cfg.get("max_framing_sec", 7.5),
-        lost_timeout_sec=spot_cfg.get("lost_timeout_sec", 1.8),
-        return_home_settle_sec=spot_cfg.get("return_home_settle_sec", 2.2),
+        max_framing_sec=spot_cfg.get("max_framing_sec", 4.0),
+        lost_timeout_sec=spot_cfg.get("lost_timeout_sec", 1.2),
+        return_home_settle_sec=spot_cfg.get("return_home_settle_sec", 2.0),
         manual_pause_sec=spot_cfg.get("manual_pause_sec", 60.0),
+        enhancer=enhancer,
+        burst_stacking=bool(spot_cfg.get("burst_stacking", True)),
     )
 
     per_species_cooldown = float(spot_cfg.get("per_species_cooldown_sec", 300.0))
@@ -245,6 +259,7 @@ def run_spotter(cfg: dict, duration_sec: float | None = None) -> int:
                 bgr_crop=best.bgr_crop,
                 species_name=species_name,
                 snapshots_dir=snapshots_dir,
+                enhancer=enhancer,
             )
 
         rec = db.record_sighting(
@@ -313,6 +328,7 @@ def run_spotter(cfg: dict, duration_sec: float | None = None) -> int:
             bgr_crop=crop if p_det is not None else None,
             species_name=species_name,
             snapshots_dir=snapshots_dir,
+            enhancer=enhancer,
         )
         if not snap_file:
             return {"success": False}

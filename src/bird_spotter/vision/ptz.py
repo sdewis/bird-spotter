@@ -56,6 +56,7 @@ class ObsbotPTZ:
     # Hardware Motorized Lens Focus (autofocus or manual 0..100)
     autofocus: bool = True
     focus: int = 50
+    hardware_sharpness: int = 45
 
     # Home / Feeder preset (usual detection mode position)
     home_pan: int = 0
@@ -93,6 +94,7 @@ class ObsbotPTZ:
         self.fov = self.home_fov
         self.autofocus = self.home_autofocus
         self.focus = self.home_focus
+        self.set_hardware_sharpness(self.hardware_sharpness)
 
     def connect_sdk(self, wait_ms: int = 3500) -> bool:
         """Connect to the native OBSBOT C++ SDK (obsbot_sdk) and configure camera for bird spotting."""
@@ -440,6 +442,25 @@ class ObsbotPTZ:
             return False
         return True
 
+    def set_hardware_sharpness(self, val: int = 45) -> bool:
+        """Configure OBSBOT Tiny SE hardware ISP sharpness (default 45).
+
+        Lowering hardware sharpness from factory 74 to 45 eliminates edge ringing,
+        white halos, and stepped pixel artifacts on digital crops.
+        """
+        with self._lock:
+            self.hardware_sharpness = max(0, min(100, int(val)))
+            sharp = self.hardware_sharpness
+        try:
+            subprocess.Popen(
+                ["v4l2-ctl", "-d", self.device, "--set-ctrl", f"sharpness={sharp}"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return True
+        except OSError:
+            return False
+
     def zoom_in(self, step: float | None = None) -> float:
         """Zoom in by step."""
         st = step or self.zoom_step
@@ -509,6 +530,7 @@ class ObsbotPTZ:
         with self._lock:
             self.system_power_on = True
             self.tracking_enabled = True
+        self.set_hardware_sharpness(self.hardware_sharpness)
         self.return_to_home()
 
     def nudge(self, d_pan: int, d_tilt: int) -> None:

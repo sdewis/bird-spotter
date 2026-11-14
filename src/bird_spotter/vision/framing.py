@@ -20,6 +20,7 @@ from bird_spotter.vision.detector import (
     compute_crop_sharpness,
     extract_bird_crop,
 )
+from bird_spotter.vision.enhancer import SuperResolutionEnhancer
 from bird_spotter.vision.ptz import ObsbotPTZ
 
 
@@ -50,8 +51,9 @@ def save_clean_snapshot_and_thumb(
     species_name: str,
     snapshots_dir: Path,
     now_dt: datetime | None = None,
+    enhancer: SuperResolutionEnhancer | None = None,
 ) -> tuple[str | None, str | None]:
-    """Save clean full-resolution JPEG and square thumbnail crop to snapshots_dir."""
+    """Save clean full-resolution JPEG and AI super-resolved square thumbnail crop to snapshots_dir."""
     if bgr_frame is None or bgr_frame.size == 0:
         return None, None
 
@@ -71,10 +73,13 @@ def save_clean_snapshot_and_thumb(
 
     thumb_rel: str | None = snap_filename
     if bgr_crop is not None and bgr_crop.size > 0:
-        thumb_img = cv2.resize(bgr_crop, (320, 320), interpolation=cv2.INTER_AREA)
+        if enhancer is not None:
+            thumb_img = enhancer.enhance_crop(bgr_crop, target_size=(320, 320))
+        else:
+            thumb_img = cv2.resize(bgr_crop, (320, 320), interpolation=cv2.INTER_LANCZOS4)
         thumb_name = f"thumb_{ts_str}_{slug}.jpg"
         thumb_path = thumbs_dir / thumb_name
-        if cv2.imwrite(str(thumb_path), thumb_img, [int(cv2.IMWRITE_JPEG_QUALITY), 92]):
+        if cv2.imwrite(str(thumb_path), thumb_img, [int(cv2.IMWRITE_JPEG_QUALITY), 95]):
             thumb_rel = f"thumbs/{thumb_name}"
 
     return snap_filename, thumb_rel
@@ -85,14 +90,16 @@ class AutoFrameController:
     """Manages PTZ auto-framing, dynamic zoom, burst sharpness selection, and return-to-home."""
 
     ptz: ObsbotPTZ
-    target_min_area: float = 0.10
-    target_max_area: float = 0.35
+    target_min_area: float = 0.03
+    target_max_area: float = 0.12
     settle_delay_sec: float = 0.30
     burst_count: int = 5
     max_framing_sec: float = 4.0
     lost_timeout_sec: float = 1.2
     return_home_settle_sec: float = 2.0
     manual_pause_sec: float = 60.0
+    enhancer: SuperResolutionEnhancer | None = None
+    burst_stacking: bool = True
 
     state: FramingState = FramingState.WATCHING_HOME
     state_entered_ts: float = field(default_factory=time.monotonic)
@@ -302,6 +309,16 @@ class AutoFrameController:
                 if (t - self.last_bird_seen_ts) >= self.lost_timeout_sec:
                     if self._framing_candidates:
                         best = max(self._framing_candidates, key=lambda c: c.sharpness)
+                        if self.burst_stacking and self.enhancer is not None and len(self._framing_candidates) > 1:
+                            fused = self.enhancer.align_and_fuse_burst(self._framing_candidates)
+                            if fused is not None:
+                                best = BurstCandidate(
+                                    bgr_frame=fused[0],
+                                    bgr_crop=fused[1],
+                                    detection=best.detection,
+                                    sharpness=best.sharpness,
+                                    zoom=best.zoom,
+                                )
                         spotter_log.info(
                             "FRAMER",
                             f"Bird left during FRAMING_BIRD; salvaging sharpest framing shot "
@@ -346,8 +363,21 @@ class AutoFrameController:
             if len(self._burst_buffer) >= self.burst_count or burst_timed_out:
                 pool = self._burst_buffer + self._framing_candidates
                 if len(pool) > 0:
-                    # Pick sharpest candidate across burst + framing buffer via Laplacian variance
+                    # Pick sharpest candidate across burst + framing buffer via noise-robust Laplacian variance
                     best = max(pool, key=lambda c: c.sharpness)
+
+                    # Multi-frame sub-pixel alignment & noise reduction burst fusion
+                    if self.burst_stacking and self.enhancer is not None and len(self._burst_buffer) > 1:
+                        fused = self.enhancer.align_and_fuse_burst(self._burst_buffer)
+                        if fused is not None:
+                            best = BurstCandidate(
+                                bgr_frame=fused[0],
+                                bgr_crop=fused[1],
+                                detection=best.detection,
+                                sharpness=best.sharpness,
+                                zoom=best.zoom,
+                            )
+
                     spotter_log.info(
                         "FRAMER",
                         f"Burst complete: selected sharpest frame (sharpness={best.sharpness:.1f}, zoom={best.zoom:.2f}x) "
